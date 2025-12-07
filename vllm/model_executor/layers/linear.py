@@ -1422,3 +1422,109 @@ class RowParallelLinear(LinearBase):
         s += f", tp_size={self.tp_size}"
         s += f", reduce_results={self.reduce_results}"
         return s
+
+
+@CustomOp.register("decomposed_linear")
+class DecomposedLinear(LinearBase):
+    """
+    Linear layer decomposed into two sequential linear layers: a and b.
+    Corresponds to W = B @ A.
+    The input x is multiplied by A, then the result is multiplied by B.
+
+    Args:
+        input_size: input dimension of the linear layer.
+        output_size: output dimension of the linear layer.
+        mid_size: intermediate dimension size.
+        pre_layer_cls: Class for the 'a' layer.
+        post_layer_cls: Class for the 'b' layer.
+        pre_layer_kwargs: Keyword arguments for the 'a' layer.
+        post_layer_kwargs: Keyword arguments for the 'b' layer.
+        bias: If true, add bias to the 'b' layer.
+        skip_bias_add: If true, skip adding bias but instead return it.
+        params_dtype: Data type for the parameters.
+        quant_config: Quantization configure.
+        prefix: The name of the layer in the state dict.
+        disable_tp: If true, tensor parallelism will be disabled.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        mid_size: int,
+        pre_layer_cls: type[LinearBase] = ColumnParallelLinear,
+        post_layer_cls: type[LinearBase] = RowParallelLinear,
+        pre_layer_kwargs: dict[str, Any] | None = None,
+        post_layer_kwargs: dict[str, Any] | None = None,
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: torch.dtype | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        disable_tp: bool = False,
+    ):
+        super().__init__(
+            input_size,
+            output_size,
+            skip_bias_add,
+            params_dtype,
+            quant_config,
+            prefix,
+            return_bias=True,  # We manage return_bias in forward
+            disable_tp=disable_tp,
+        )
+        self.mid_size = mid_size
+
+        if pre_layer_kwargs is None:
+            pre_layer_kwargs = {}
+        if post_layer_kwargs is None:
+            post_layer_kwargs = {}
+
+        # Layer 'a': input -> mid
+        # Usually 'a' does not have bias in decomposition
+        self.a = pre_layer_cls(
+            input_size=input_size,
+            output_size=mid_size,
+            bias=False,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=f"{prefix}.a",
+            disable_tp=disable_tp,
+            **pre_layer_kwargs,
+        )
+
+        # Layer 'b': mid -> output
+        # 'b' handles the bias of the original layer
+        self.b = post_layer_cls(
+            input_size=mid_size,
+            output_size=output_size,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=f"{prefix}.b",
+            disable_tp=disable_tp,
+            **post_layer_kwargs,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        # Apply layer 'a'
+        # 'a' has no bias, so it returns just the tensor (or we discard bias if any)
+        out_a = self.a(x)
+        if isinstance(out_a, tuple):
+            out_a = out_a[0]
+
+        # Apply layer 'b'
+        # 'b' might return (output, bias) if skip_bias_add is True or return_bias is True
+        out_b = self.b(out_a)
+
+        return out_b
+
+    def extra_repr(self) -> str:
+        s = f"in_features={self.input_size}"
+        s += f", mid_features={self.mid_size}"
+        s += f", output_features={self.output_size}"
+        return s
