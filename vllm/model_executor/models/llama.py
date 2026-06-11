@@ -106,8 +106,10 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        # Marker: FFN matmul (gate_up_proj)
         x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
+        # Marker: FFN matmul (down_proj)
         x, _ = self.down_proj(x)
         return x
 
