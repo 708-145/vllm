@@ -42,20 +42,22 @@ See [Inference Hooks](inference_hooks.md) for full recording options.
 
 ## How it works
 
-For each token position in the recorded data the predictor performs a
-**leave-one-out** evaluation: it treats each token as the query, finds its
-K nearest neighbours among all other tokens in the same layer using cosine
-similarity on the `gate_up_input` hidden states, and ORs their activation
-masks together.
+The token dataset is split into a **library** (default: first 80 %) and an
+**eval set** (remaining 20 %).  For each eval token the predictor finds the K
+nearest library tokens by cosine similarity on `gate_up_input` hidden states
+and ORs their binarised activation masks together.
 
 ```
-query x_i  ──cosine sim──▶  top-K neighbours {x_j}
-                                    │
-                            OR(mask_j for j in top-K)
-                                    │
-                             predicted mask m̂_i
-                                    │
-                         compare with true mask m_i
+  library tokens                   eval tokens
+  {(x_j, mask_j)}  ◀──cosine sim──  query x_i
+                          │
+                  top-K library neighbours
+                          │
+                  OR(mask_j for j in top-K)
+                          │
+                   predicted mask m̂_i
+                          │
+               compare with true mask m_i
 ```
 
 The binary mask `m_i` is derived from `down_input` (the post-SiluAndMul
@@ -77,15 +79,27 @@ metric; density (fraction of neurons predicted active) is the sparsity cost.
 .venv/bin/python tools/profiler/O1_predict.py --input ffn_activations.npz
 ```
 
-Evaluates all layers present in the file with defaults: K=3, threshold=70th
+Evaluates all layers with defaults: 80/20 train split, K=3, threshold=70th
 percentile.  Prints a per-layer table to stdout:
 
 ```
-Layer 0:  512 tokens,  H=2048,  I=8192
+Layer 0:  512 tokens  (library=409, eval=103),  H=2048,  I=8192
      K  thresh%    recall   precision   density
   ----------------------------------------------
      3      70.0     0.943       0.521     0.574
 ```
+
+### Adjust the train/eval split
+
+```bash
+.venv/bin/python tools/profiler/O1_predict.py \
+    --input ffn_activations.npz \
+    --train-split 0.9
+```
+
+Uses 90 % of tokens as the lookup library and the remaining 10 % for
+evaluation.  A larger library generally improves recall; a larger eval set
+gives more reliable metric estimates.
 
 ### Sweep K and threshold
 
@@ -101,7 +115,7 @@ Each combination of `--top-k` and `--threshold-pct` is evaluated and printed
 as a separate row, making it easy to read off the recall/density trade-off:
 
 ```
-Layer 0:  512 tokens,  H=2048,  I=8192
+Layer 0:  512 tokens  (library=409, eval=103),  H=2048,  I=8192
      K  thresh%    recall   precision   density
   ----------------------------------------------
      1      70.0     0.821       0.712     0.421
@@ -134,6 +148,7 @@ for downstream analysis in a notebook or spreadsheet.
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--input` | *(required)* | `.npz` file from `record_ffn_activations.py` |
+| `--train-split F` | `0.8` | Fraction of tokens used as the lookup library; the rest are eval |
 | `--layers N …` | all | Layer indices to evaluate |
 | `--top-k K …` | `3` | Neighbour count(s) to retrieve and OR; multiple values sweep |
 | `--threshold-pct P …` | `70` | Percentile(s) for binarising activations; multiple values sweep |

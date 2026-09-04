@@ -31,6 +31,11 @@ Usage::
         --top-k 1 3 5 \\
         --threshold-pct 70 80 90
 
+    # Use 90 % of tokens as the lookup library, evaluate on the rest
+    python tools/profiler/O1_predict.py \\
+        --input ffn_activations.npz \\
+        --train-split 0.9
+
     # Save per-token detail to CSV
     python tools/profiler/O1_predict.py \\
         --input ffn_activations.npz \\
@@ -74,33 +79,38 @@ def binarise(acts: np.ndarray, threshold_pct: float) -> np.ndarray:
 
 
 def predict_masks(
-    inputs: np.ndarray,
-    masks: np.ndarray,
+    query_inputs: np.ndarray,
+    query_masks: np.ndarray,
+    library_masks: np.ndarray,
     top_k: int,
     sim: np.ndarray | None = None,
 ) -> np.ndarray:
     """Predict activation masks via OR of top-K nearest neighbours.
 
     Args:
-        inputs: shape [T, H] input hidden states.
-        masks: shape [T, I] ground-truth binary masks.
+        query_inputs: shape [Q, H] input hidden states for eval tokens.
+        query_masks: shape [Q, I] ground-truth masks for eval tokens (unused
+            in prediction; kept for API symmetry and future use).
+        library_masks: shape [L, I] ground-truth masks for library tokens.
         top_k: number of nearest neighbours to retrieve and OR.
-        sim: precomputed [T, T] cosine similarity matrix; computed if None.
+        sim: precomputed [Q, L] cosine similarity matrix; computed if None.
 
     Returns:
-        predicted: boolean array of shape [T, I].
+        predicted: boolean array of shape [Q, I].
     """
     if sim is None:
-        sim = cosine_similarity_matrix(inputs)
+        sim = cosine_similarity_matrix(
+            np.vstack([query_inputs,
+                       np.zeros((library_masks.shape[0], query_inputs.shape[1]),
+                                dtype=query_inputs.dtype)])
+        )[:query_inputs.shape[0], query_inputs.shape[0]:]
 
-    T = inputs.shape[0]
-    predicted = np.zeros_like(masks)
+    Q = query_inputs.shape[0]
+    predicted = np.zeros_like(query_masks)
 
-    for i in range(T):
-        row = sim[i].copy()
-        row[i] = -2.0  # exclude self
-        neighbours = np.argpartition(row, -top_k)[-top_k:]
-        predicted[i] = masks[neighbours].any(axis=0)
+    for i in range(Q):
+        neighbours = np.argpartition(sim[i], -top_k)[-top_k:]
+        predicted[i] = library_masks[neighbours].any(axis=0)
 
     return predicted
 
@@ -145,6 +155,15 @@ def _parse_args(argv=None) -> argparse.Namespace:
         "--input",
         required=True,
         help=".npz file produced by record_ffn_activations.py.",
+    )
+    p.add_argument(
+        "--train-split",
+        type=float,
+        default=0.8,
+        metavar="F",
+        help="Fraction of tokens used as the lookup library (default: 0.8). "
+        "The remaining tokens are used for evaluation. "
+        "Tokens are split in order (first F*T for library, rest for eval).",
     )
     p.add_argument(
         "--layers",
@@ -229,8 +248,24 @@ def main(argv=None) -> None:
         acts = data[acts_key].astype(np.float32)  # [T, I]
         T = inputs.shape[0]
 
+        n_train = max(1, int(T * args.train_split))
+        n_eval = T - n_train
+        if n_eval == 0:
+            print(
+                f"  layer {layer_idx}: not enough tokens for eval split "
+                f"(T={T}, train_split={args.train_split}), skipping.",
+                file=sys.stderr,
+            )
+            continue
+
+        train_inputs = inputs[:n_train]
+        eval_inputs = inputs[n_train:]
+        train_acts = acts[:n_train]
+        eval_acts = acts[n_train:]
+
         print(
-            f"\nLayer {layer_idx}:  {T} tokens,  "
+            f"\nLayer {layer_idx}:  {T} tokens  "
+            f"(library={n_train}, eval={n_eval}),  "
             f"H={inputs.shape[1]},  I={acts.shape[1]}"
         )
         print(
@@ -239,13 +274,20 @@ def main(argv=None) -> None:
         )
         print("  " + "-" * 46)
 
-        # Precompute similarity once per layer
-        sim = cosine_similarity_matrix(inputs)
+        # Precompute query→library similarity once per layer
+        train_norms = np.linalg.norm(train_inputs, axis=1, keepdims=True)
+        train_norms = np.where(train_norms == 0, 1e-9, train_norms)
+        eval_norms = np.linalg.norm(eval_inputs, axis=1, keepdims=True)
+        eval_norms = np.where(eval_norms == 0, 1e-9, eval_norms)
+        sim = (eval_inputs / eval_norms) @ (train_inputs / train_norms).T  # [Q, L]
 
         for threshold_pct, top_k in product(args.threshold_pct, args.top_k):
-            masks_true = binarise(acts, threshold_pct)
-            masks_pred = predict_masks(inputs, masks_true, top_k, sim=sim)
-            metrics = evaluate(masks_true, masks_pred)
+            train_masks = binarise(train_acts, threshold_pct)
+            eval_masks = binarise(eval_acts, threshold_pct)
+            masks_pred = predict_masks(
+                eval_inputs, eval_masks, train_masks, top_k, sim=sim
+            )
+            metrics = evaluate(eval_masks, masks_pred)
 
             mean_recall = metrics["recall"].mean()
             mean_precision = metrics["precision"].mean()
@@ -258,11 +300,11 @@ def main(argv=None) -> None:
             )
 
             if args.output_csv is not None:
-                for token_idx in range(T):
+                for token_idx in range(n_eval):
                     csv_rows.append(
                         {
                             "layer": layer_idx,
-                            "token": token_idx,
+                            "token": n_train + token_idx,
                             "top_k": top_k,
                             "threshold_pct": threshold_pct,
                             "recall": float(metrics["recall"][token_idx]),
