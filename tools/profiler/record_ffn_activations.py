@@ -47,6 +47,7 @@ Usage::
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -260,6 +261,22 @@ def _parse_args(argv=None) -> argparse.Namespace:
         default="auto",
         help="Model dtype passed to LLM (default: auto).",
     )
+    p.add_argument(
+        "--kv-cache-gb",
+        type=float,
+        default=1.0,
+        metavar="GB",
+        help="KV cache size in GiB (default: 1.0). "
+        "Kept small on CPU/Mac to avoid OOM; increase for longer sequences.",
+    )
+    p.add_argument(
+        "--max-model-len",
+        type=int,
+        default=2048,
+        metavar="N",
+        help="Maximum sequence length (default: 2048). "
+        "Reducing this shrinks the KV cache and lowers RAM usage.",
+    )
     return p.parse_args(argv)
 
 
@@ -269,11 +286,25 @@ def main(argv=None) -> None:
     # Import here so the module is importable without vllm installed
     from vllm import LLM, SamplingParams
 
-    print(f"Loading model: {args.model}", file=sys.stderr)
+    # Disable multiprocessing so the model lives in-process and is reachable
+    # via llm.llm_engine.model_executor.  In multiprocess mode (the v1 default)
+    # the model runs in a subprocess and cannot be accessed directly.
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    kv_bytes = int(args.kv_cache_gb * 1024**3)
+    print(
+        f"Loading model: {args.model}  "
+        f"(KV cache: {args.kv_cache_gb:.1f} GiB, "
+        f"max_model_len: {args.max_model_len})",
+        file=sys.stderr,
+    )
+
     llm = LLM(
         model=args.model,
         dtype=args.dtype,
         enforce_eager=True,  # Required: CUDA graphs bypass Python hooks
+        kv_cache_memory_bytes=kv_bytes,
+        max_model_len=args.max_model_len,
     )
 
     # Reach the underlying nn.Module

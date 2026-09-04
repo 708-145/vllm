@@ -15,16 +15,24 @@ and evaluates prediction quality without touching the model.
 
 ## Prerequisites
 
-Activate the project virtualenv from the repository root:
+
+The venv lives at `.venv/` inside the repository root.  On macOS `python` may
+not resolve to the venv Python even after activation — use the explicit path:
 
 ```bash
-source .venv/bin/activate   # from the vllm/ repo root
+# Create once if needed (from the vllm/ repo root):
+uv venv --python 3.12
+uv pip install numpy torch
+
+# Run with the venv Python explicitly:
+.venv/bin/python tools/profiler/O1_predict.py ...
 ```
 
-Then record FFN activations for the prompts you want to analyse:
+First record FFN activations (requires a full vllm install — see
+[Inference Hooks](inference_hooks.md#hook-based-activation-sampling-cli)):
 
 ```bash
-python tools/profiler/record_ffn_activations.py \
+.venv/bin/python tools/profiler/record_ffn_activations.py \
     --model meta-llama/Llama-3.2-1B \
     --prompts "The capital of France is" "Once upon a time" \
     --output ffn_activations.npz
@@ -66,7 +74,7 @@ metric; density (fraction of neurons predicted active) is the sparsity cost.
 ### Basic
 
 ```bash
-python tools/profiler/O1_predict.py --input ffn_activations.npz
+.venv/bin/python tools/profiler/O1_predict.py --input ffn_activations.npz
 ```
 
 Evaluates all layers present in the file with defaults: K=3, threshold=70th
@@ -82,7 +90,7 @@ Layer 0:  512 tokens,  H=2048,  I=8192
 ### Sweep K and threshold
 
 ```bash
-python tools/profiler/O1_predict.py \
+.venv/bin/python tools/profiler/O1_predict.py \
     --input ffn_activations.npz \
     --layers 0 15 \
     --top-k 1 3 5 \
@@ -110,7 +118,7 @@ Layer 0:  512 tokens,  H=2048,  I=8192
 ### Save per-token detail
 
 ```bash
-python tools/profiler/O1_predict.py \
+.venv/bin/python tools/profiler/O1_predict.py \
     --input ffn_activations.npz \
     --layers 0 15 \
     --top-k 1 3 5 \

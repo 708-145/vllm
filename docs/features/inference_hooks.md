@@ -108,17 +108,25 @@ because it uses plain PyTorch hooks with `enforce_eager=True`.
 
 #### Environment
 
-The script must be run inside the project virtualenv.  If you have not created
-it yet, follow the [environment setup](../contributing/README.md) steps.  Then
-activate it from the repository root before running any command in this section:
+The script must be run with the repo-local virtualenv's Python.  The venv
+lives at `.venv/` inside the repository root and is managed with `uv`:
 
 ```bash
-source .venv/bin/activate   # from the vllm/ repo root
+# Create once if needed (from the vllm/ repo root):
+uv venv --python 3.12
+uv pip install numpy torch
 ```
 
-All `python` and `pip` commands below assume the venv is active.  Never use the
-system Python or a bare `pip install` — the project uses
-[`uv`](https://github.com/astral-sh/uv) to manage the venv.
+On macOS `python` may not exist or may resolve to the system Homebrew Python
+even after `source .venv/bin/activate`.  Always invoke the interpreter
+explicitly to be safe:
+
+```bash
+.venv/bin/python tools/profiler/record_ffn_activations.py ...
+```
+
+Never use `python3` from the system or a bare `pip install` — all packages
+must be installed inside `.venv/` via `uv pip`.
 
 #### What is recorded
 
@@ -141,20 +149,20 @@ computation for those tokens.
 
 ```bash
 # Record all layers, 1 generated token per prompt
-python tools/profiler/record_ffn_activations.py \
+.venv/bin/python tools/profiler/record_ffn_activations.py \
     --model meta-llama/Llama-3.2-1B \
     --prompts "The capital of France is" "Once upon a time" \
     --output ffn_activations.npz
 
 # Record only layers 0 and 15 (reduces memory and file size)
-python tools/profiler/record_ffn_activations.py \
+.venv/bin/python tools/profiler/record_ffn_activations.py \
     --model meta-llama/Llama-3.2-1B \
     --prompts "Hello world" \
     --layers 0 15 \
     --output ffn_activations.npz
 
 # Generate 16 tokens and record all layers
-python tools/profiler/record_ffn_activations.py \
+.venv/bin/python tools/profiler/record_ffn_activations.py \
     --model meta-llama/Llama-3.2-1B \
     --prompts "Explain quantum computing" \
     --max-tokens 16 \
@@ -164,13 +172,20 @@ python tools/profiler/record_ffn_activations.py \
 Full option reference:
 
 ```
---model        Model name or local path (required)
---prompts      One or more prompt strings (required)
---layers N …   Layer indices to record; omit to record all layers
---max-tokens   Number of new tokens to generate per prompt (default: 1)
---output       Output .npz path (default: ffn_activations.npz)
---dtype        Model dtype, e.g. float16, bfloat16, auto (default: auto)
+--model          Model name or local path (required)
+--prompts        One or more prompt strings (required)
+--layers N …     Layer indices to record; omit to record all layers
+--max-tokens     Number of new tokens to generate per prompt (default: 1)
+--output         Output .npz path (default: ffn_activations.npz)
+--dtype          Model dtype, e.g. float16, bfloat16, auto (default: auto)
+--kv-cache-gb    KV cache size in GiB (default: 1.0); keep small on CPU/Mac
+--max-model-len  Maximum sequence length (default: 2048)
 ```
+
+!!! note
+    The script sets `VLLM_ENABLE_V1_MULTIPROCESSING=0` automatically so the
+    model runs in-process and hooks can be attached.  This is required for hook
+    access and is safe for single-prompt recording runs.
 
 #### Analysing the results
 
