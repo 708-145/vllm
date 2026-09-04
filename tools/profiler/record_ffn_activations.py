@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Record FFN (gate/up projection) activation tensors during vLLM inference.
+"""Record FFN activation tensors during vLLM inference.
 
 For each transformer layer this script captures:
 
-  * ``gate_up_proj`` **input**  – hidden states entering the MLP
+  * ``gate_up_proj`` **input**  – hidden states entering the MLP,
     shape ``[num_tokens, hidden_size]``
-
-  * ``gate_up_proj`` **raw output** – pre-activation concatenation
-    ``[gate | up]``, shape ``[num_tokens, 2 * intermediate_size]``
 
   * ``down_proj`` **input** – post-SiluAndMul activations feeding the
     down-projection, shape ``[num_tokens, intermediate_size]``.
@@ -18,13 +15,16 @@ For each transformer layer this script captures:
   * Per-neuron **mean absolute activity** (scalar per intermediate neuron,
     averaged across all tokens) for quick analysis of neuron utilisation.
 
-All tensors are moved to CPU before saving.  Results are written to a
+Tensors are streamed to temporary files on disk during inference so that
+peak RAM is bounded to roughly one batch's activations regardless of how
+many prompts are processed.  The model is deleted before the final
+concatenation step to reclaim its memory.  Results are written to a
 NumPy ``.npz`` archive with keys of the form::
 
     layer<N>/<quantity>
 
-where ``<quantity>`` is one of ``gate_up_input``, ``gate_raw``,
-``up_raw``, ``down_input``, ``neuron_activity``.
+where ``<quantity>`` is one of ``gate_up_input``, ``down_input``,
+``neuron_activity``.
 
 Usage::
 
@@ -57,6 +57,7 @@ import argparse
 import os
 import random
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -68,71 +69,79 @@ import torch
 
 
 class _FFNRecorder:
-    """Accumulates FFN activation tensors across all forward calls.
+    """Streams FFN activation tensors to temp files during inference.
+
+    Each tensor chunk (one per hook call) is immediately written to a
+    per-layer temporary file via ``np.save``, so peak RAM is bounded to
+    roughly one batch's activations.  Call ``to_numpy()`` after inference
+    (and after deleting the model) to concatenate the temp files into
+    the final arrays.
 
     Args:
-        save_tensors: When True, every per-token tensor is kept in memory and
-            saved to the .npz archive (``gate_up_input``, ``down_input``).
-            When False (default), only the running mean absolute activity per
-            neuron is maintained — O(intermediate_size) memory regardless of
-            the number of tokens processed.
+        save_tensors: When True (default), ``gate_up_input`` and
+            ``down_input`` are streamed to disk and concatenated at the end.
+            When False, only the running ``neuron_activity`` mean is kept.
     """
 
     def __init__(self, save_tensors: bool = True) -> None:
         self.save_tensors = save_tensors
 
-        # Per-token storage (used only when save_tensors=True)
-        self._gate_up_inputs: dict[int, list[torch.Tensor]] = {}
-        self._down_inputs: dict[int, list[torch.Tensor]] = {}
+        # Temp files: layer_idx -> {key: [NamedTemporaryFile, ...]}
+        self._tmp: dict[int, dict[str, list]] = {}
 
         # Online mean of |down_input| per layer: (sum_abs, count)
         self._act_sum: dict[int, np.ndarray] = {}
         self._act_count: dict[int, int] = {}
+
+    def _append(self, layer_idx: int, key: str, arr: np.ndarray) -> None:
+        """Write arr to a new temp file, remembered for later concatenation."""
+        f = tempfile.NamedTemporaryFile(suffix=".npy", delete=False)
+        np.save(f, arr)
+        f.close()
+        self._tmp.setdefault(layer_idx, {}).setdefault(key, []).append(f.name)
 
     # -- hook factories ------------------------------------------------------
 
     def gate_up_pre_hook(self, layer_idx: int):
         def _hook(module, args, kwargs):
             if self.save_tensors:
-                x = args[0].detach().cpu()
-                self._gate_up_inputs.setdefault(layer_idx, []).append(x)
+                x = args[0].detach().float().cpu().numpy()
+                self._append(layer_idx, "gate_up_input", x)
 
         return _hook
 
     def down_pre_hook(self, layer_idx: int):
         def _hook(module, args, kwargs):
             x = args[0].detach().float().cpu()
+            arr = x.numpy()
             if self.save_tensors:
-                self._down_inputs.setdefault(layer_idx, []).append(x)
-            # Always update the running mean of |activation|
-            abs_x = x.abs().numpy()
+                self._append(layer_idx, "down_input", arr)
+            # Always update running mean of |activation|
             if layer_idx in self._act_sum:
-                self._act_sum[layer_idx] += abs_x.sum(axis=0)
-                self._act_count[layer_idx] += abs_x.shape[0]
+                self._act_sum[layer_idx] += np.abs(arr).sum(axis=0)
+                self._act_count[layer_idx] += arr.shape[0]
             else:
-                self._act_sum[layer_idx] = abs_x.sum(axis=0)
-                self._act_count[layer_idx] = abs_x.shape[0]
+                self._act_sum[layer_idx] = np.abs(arr).sum(axis=0)
+                self._act_count[layer_idx] = arr.shape[0]
 
         return _hook
 
     # -- results -------------------------------------------------------------
 
     def to_numpy(self) -> dict[str, np.ndarray]:
-        """Return a flat key→array dict with all recorded quantities."""
+        """Concatenate temp files into final arrays and clean up."""
         results: dict[str, np.ndarray] = {}
         all_layers = sorted(self._act_count)
 
         for layer_idx in all_layers:
             prefix = f"layer{layer_idx}"
 
-            if self.save_tensors:
-                if layer_idx in self._gate_up_inputs:
-                    cat = torch.cat(self._gate_up_inputs[layer_idx], dim=0)
-                    results[f"{prefix}/gate_up_input"] = cat.float().numpy()
-
-                if layer_idx in self._down_inputs:
-                    cat = torch.cat(self._down_inputs[layer_idx], dim=0)
-                    results[f"{prefix}/down_input"] = cat.numpy()
+            if self.save_tensors and layer_idx in self._tmp:
+                for key, paths in self._tmp[layer_idx].items():
+                    chunks = [np.load(p) for p in paths]
+                    results[f"{prefix}/{key}"] = np.concatenate(chunks, axis=0)
+                    for p in paths:
+                        os.unlink(p)
 
             # neuron_activity is always written
             count = self._act_count[layer_idx]
@@ -458,6 +467,10 @@ def main(argv=None) -> None:
 
     for h in handles:
         h.remove()
+
+    # Delete the model before concatenating temp files — frees the largest
+    # block of RAM before the (potentially large) final concatenation.
+    del model, llm
 
     results = recorder.to_numpy()
 

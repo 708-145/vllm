@@ -138,9 +138,13 @@ For each instrumented transformer layer the script records:
 | `layer<N>/down_input` | `[T, I]` | Post-SiluAndMul activations that feed `down_proj` (`I` = intermediate size) |
 | `layer<N>/neuron_activity` | `[I]` | Mean absolute value of `down_input` across all `T` tokens |
 
-Pass `--no-save-tensors` to drop the per-token matrices and keep only
-`neuron_activity` — useful when processing large calibration sets where
-storing every token tensor would exhaust RAM.
+Tensor chunks are streamed to temporary files on disk as they are observed,
+so peak RAM during inference is bounded to roughly one batch's activations
+regardless of how many prompts are processed.  The model weights are freed
+before the final concatenation step.
+
+Pass `--no-save-tensors` to skip the per-token matrices entirely and keep
+only `neuron_activity` — the smallest possible output.
 
 #### Command line
 
