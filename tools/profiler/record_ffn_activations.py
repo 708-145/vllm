@@ -320,8 +320,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--dtype",
-        default="auto",
-        help="Model dtype passed to LLM (default: auto).",
+        default="bfloat16",
+        help="Model dtype passed to LLM (default: bfloat16).",
     )
     p.add_argument(
         "--kv-cache-gb",
@@ -351,9 +351,9 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--batch-size",
         type=int,
-        default=1,
+        default=8,
         metavar="N",
-        help="Number of prompts to pass to generate() at once (default: 1). "
+        help="Number of prompts to pass to generate() at once (default: 8). "
         "Larger values improve throughput but increase peak RAM usage.",
     )
     p.add_argument(

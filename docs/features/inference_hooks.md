@@ -195,14 +195,14 @@ Full option reference:
 --seed S               Random seed for --num-chunks sampling (default: no fixed seed)
 --chunk-len N          Truncate each prompt/chunk to at most N tokens before inference
                        (default: 512); set to 0 to disable truncation
---batch-size N         Prompts per generate() call (default: 1); increase for throughput
+--batch-size N         Prompts per generate() call (default: 8); increase for throughput
                        at the cost of higher peak RAM
 --no-save-tensors      Skip per-token tensors (gate_up_input, down_input);
                        record only neuron_activity. Reduces RAM for large calibration sets.
 --layers N …           Layer indices to record; omit to record all layers
 --max-tokens           Number of new tokens to generate per prompt (default: 1)
 --output               Output .npz path (default: ffn_activations.npz)
---dtype                Model dtype, e.g. float16, bfloat16, auto (default: auto)
+--dtype                Model dtype, e.g. float16, bfloat16, auto (default: bfloat16)
 --kv-cache-gb          KV cache size in GiB (default: 1.0); keep small on CPU/Mac
 --max-model-len        Maximum sequence length (default: 2048)
 ```
