@@ -29,15 +29,22 @@ where ``<quantity>`` is one of ``gate_up_input``, ``gate_raw``,
 Usage::
 
     python tools/profiler/record_ffn_activations.py \\
-        --model meta-llama/Llama-3.2-1B \\
+        --model ibm-granite/granite-4.2-3b \\
         --prompts "The capital of France is" "Once upon a time" \\
         --output ffn_activations.npz
 
     # Record only layers 0 and 15 to keep the file small:
     python tools/profiler/record_ffn_activations.py \\
-        --model meta-llama/Llama-3.2-1B \\
+        --model ibm-granite/granite-4.2-3b \\
         --prompts "Hello world" \\
         --layers 0 15 \\
+        --output ffn_activations.npz
+
+    # Use a calibration set file, sample 128 random chunks:
+    python tools/profiler/record_ffn_activations.py \\
+        --model ibm-granite/granite-4.2-3b \\
+        --calibration-set bartowski-imatrix-v5-semantic.txt \\
+        --num-chunks 128 \\
         --output ffn_activations.npz
 
     # Load and inspect results:
@@ -48,6 +55,7 @@ Usage::
 
 import argparse
 import os
+import random
 import sys
 from pathlib import Path
 
@@ -60,71 +68,77 @@ import torch
 
 
 class _FFNRecorder:
-    """Accumulates FFN activation tensors across all forward calls."""
+    """Accumulates FFN activation tensors across all forward calls.
 
-    def __init__(self) -> None:
-        # Maps layer_idx -> list of tensors collected across calls
+    Args:
+        save_tensors: When True, every per-token tensor is kept in memory and
+            saved to the .npz archive (``gate_up_input``, ``down_input``).
+            When False (default), only the running mean absolute activity per
+            neuron is maintained — O(intermediate_size) memory regardless of
+            the number of tokens processed.
+    """
+
+    def __init__(self, save_tensors: bool = True) -> None:
+        self.save_tensors = save_tensors
+
+        # Per-token storage (used only when save_tensors=True)
         self._gate_up_inputs: dict[int, list[torch.Tensor]] = {}
-        self._gate_up_outputs: dict[int, list[torch.Tensor]] = {}
         self._down_inputs: dict[int, list[torch.Tensor]] = {}
+
+        # Online mean of |down_input| per layer: (sum_abs, count)
+        self._act_sum: dict[int, np.ndarray] = {}
+        self._act_count: dict[int, int] = {}
 
     # -- hook factories ------------------------------------------------------
 
     def gate_up_pre_hook(self, layer_idx: int):
         def _hook(module, args, kwargs):
-            x = args[0].detach().cpu()
-            self._gate_up_inputs.setdefault(layer_idx, []).append(x)
-
-        return _hook
-
-    def gate_up_post_hook(self, layer_idx: int):
-        def _hook(module, args, output):
-            # output is (tensor, bias_or_None) for vLLM parallel linears
-            tensor = output[0] if isinstance(output, tuple) else output
-            self._gate_up_outputs.setdefault(layer_idx, []).append(
-                tensor.detach().cpu()
-            )
+            if self.save_tensors:
+                x = args[0].detach().cpu()
+                self._gate_up_inputs.setdefault(layer_idx, []).append(x)
 
         return _hook
 
     def down_pre_hook(self, layer_idx: int):
         def _hook(module, args, kwargs):
-            x = args[0].detach().cpu()
-            self._down_inputs.setdefault(layer_idx, []).append(x)
+            x = args[0].detach().float().cpu()
+            if self.save_tensors:
+                self._down_inputs.setdefault(layer_idx, []).append(x)
+            # Always update the running mean of |activation|
+            abs_x = x.abs().numpy()
+            if layer_idx in self._act_sum:
+                self._act_sum[layer_idx] += abs_x.sum(axis=0)
+                self._act_count[layer_idx] += abs_x.shape[0]
+            else:
+                self._act_sum[layer_idx] = abs_x.sum(axis=0)
+                self._act_count[layer_idx] = abs_x.shape[0]
 
         return _hook
 
     # -- results -------------------------------------------------------------
 
     def to_numpy(self) -> dict[str, np.ndarray]:
-        """Concatenate all collected tensors and return a flat key→array dict."""
+        """Return a flat key→array dict with all recorded quantities."""
         results: dict[str, np.ndarray] = {}
-        all_layers = sorted(
-            set(self._gate_up_inputs)
-            | set(self._gate_up_outputs)
-            | set(self._down_inputs)
-        )
+        all_layers = sorted(self._act_count)
 
         for layer_idx in all_layers:
             prefix = f"layer{layer_idx}"
 
-            if layer_idx in self._gate_up_inputs:
-                cat = torch.cat(self._gate_up_inputs[layer_idx], dim=0)
-                results[f"{prefix}/gate_up_input"] = cat.float().numpy()
+            if self.save_tensors:
+                if layer_idx in self._gate_up_inputs:
+                    cat = torch.cat(self._gate_up_inputs[layer_idx], dim=0)
+                    results[f"{prefix}/gate_up_input"] = cat.float().numpy()
 
-            if layer_idx in self._gate_up_outputs:
-                cat = torch.cat(self._gate_up_outputs[layer_idx], dim=0)
-                arr = cat.float().numpy()
-                mid = arr.shape[1] // 2
-                results[f"{prefix}/gate_raw"] = arr[:, :mid]
-                results[f"{prefix}/up_raw"] = arr[:, mid:]
+                if layer_idx in self._down_inputs:
+                    cat = torch.cat(self._down_inputs[layer_idx], dim=0)
+                    results[f"{prefix}/down_input"] = cat.numpy()
 
-            if layer_idx in self._down_inputs:
-                cat = torch.cat(self._down_inputs[layer_idx], dim=0)
-                arr = cat.float().numpy()
-                results[f"{prefix}/down_input"] = arr
-                # Mean absolute activation across tokens: shape (intermediate,)
-                results[f"{prefix}/neuron_activity"] = np.abs(arr).mean(axis=0)
+            # neuron_activity is always written
+            count = self._act_count[layer_idx]
+            results[f"{prefix}/neuron_activity"] = (
+                self._act_sum[layer_idx] / count
+            )
 
         return results
 
@@ -208,7 +222,6 @@ def register_ffn_hooks(
             gate_up.register_forward_pre_hook(
                 recorder.gate_up_pre_hook(i), with_kwargs=True
             ),
-            gate_up.register_forward_hook(recorder.gate_up_post_hook(i)),
             down.register_forward_pre_hook(recorder.down_pre_hook(i), with_kwargs=True),
         ]
 
@@ -224,6 +237,18 @@ def register_ffn_hooks(
 # ---------------------------------------------------------------------------
 
 
+def _load_calibration_set(path: str) -> list[str]:
+    """Return all non-empty lines from a calibration-set file as chunks."""
+    chunks = [
+        line.rstrip("\n")
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not chunks:
+        raise ValueError(f"Calibration set {path!r} contains no non-empty lines.")
+    return chunks
+
+
 def _parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Record FFN activation tensors during vLLM inference.",
@@ -231,11 +256,39 @@ def _parse_args(argv=None) -> argparse.Namespace:
         epilog=__doc__,
     )
     p.add_argument("--model", required=True, help="Model name or path.")
-    p.add_argument(
+
+    prompt_group = p.add_mutually_exclusive_group(required=True)
+    prompt_group.add_argument(
         "--prompts",
         nargs="+",
-        required=True,
         help="One or more prompt strings.",
+    )
+    prompt_group.add_argument(
+        "--calibration-set",
+        metavar="FILE",
+        help=(
+            "Path to a calibration-set text file. "
+            "Every non-empty line is treated as one chunk (prompt). "
+            "Use --num-chunks to sample a random subset."
+        ),
+    )
+
+    p.add_argument(
+        "--num-chunks",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Number of chunks to randomly sample from --calibration-set. "
+            "Omit (or 0) to use all chunks. Ignored when --prompts is used."
+        ),
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        metavar="S",
+        help="Random seed for --num-chunks sampling (default: no fixed seed).",
     )
     p.add_argument(
         "--layers",
@@ -277,6 +330,31 @@ def _parse_args(argv=None) -> argparse.Namespace:
         help="Maximum sequence length (default: 2048). "
         "Reducing this shrinks the KV cache and lowers RAM usage.",
     )
+    p.add_argument(
+        "--chunk-len",
+        type=int,
+        default=512,
+        metavar="N",
+        help="Maximum number of tokens per prompt/chunk (default: 512). "
+        "Chunks that exceed this limit are truncated before inference. "
+        "Set to 0 to disable truncation.",
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of prompts to pass to generate() at once (default: 1). "
+        "Larger values improve throughput but increase peak RAM usage.",
+    )
+    p.add_argument(
+        "--no-save-tensors",
+        dest="save_tensors",
+        action="store_false",
+        default=True,
+        help="Skip saving full per-token tensors (gate_up_input, down_input); "
+        "record only neuron_activity. Reduces RAM usage for large calibration sets.",
+    )
     return p.parse_args(argv)
 
 
@@ -290,6 +368,27 @@ def main(argv=None) -> None:
     # via llm.llm_engine.model_executor.  In multiprocess mode (the v1 default)
     # the model runs in a subprocess and cannot be accessed directly.
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    # Resolve prompts from either --prompts or --calibration-set
+    if args.prompts is not None:
+        prompts = args.prompts
+    else:
+        chunks = _load_calibration_set(args.calibration_set)
+        n = args.num_chunks or 0
+        if n and n < len(chunks):
+            rng = random.Random(args.seed)
+            prompts = rng.sample(chunks, n)
+            print(
+                f"Sampled {n} of {len(chunks)} chunks from "
+                f"{args.calibration_set!r} (seed={args.seed}).",
+                file=sys.stderr,
+            )
+        else:
+            prompts = chunks
+            print(
+                f"Using all {len(prompts)} chunks from {args.calibration_set!r}.",
+                file=sys.stderr,
+            )
 
     kv_bytes = int(args.kv_cache_gb * 1024**3)
     print(
@@ -310,12 +409,32 @@ def main(argv=None) -> None:
     # Reach the underlying nn.Module
     model = llm.llm_engine.model_executor.driver_worker.model_runner.model
 
-    recorder = _FFNRecorder()
+    # Truncate prompts to --chunk-len tokens so they fit within max_model_len.
+    # The tokenizer is available once the LLM is loaded.
+    if args.chunk_len > 0:
+        tokenizer = llm.get_tokenizer()
+        truncated = 0
+        capped = []
+        for p in prompts:
+            ids = tokenizer.encode(p)
+            if len(ids) > args.chunk_len:
+                p = tokenizer.decode(ids[: args.chunk_len], skip_special_tokens=True)
+                truncated += 1
+            capped.append(p)
+        if truncated:
+            print(
+                f"Truncated {truncated} of {len(capped)} prompts to "
+                f"{args.chunk_len} tokens.",
+                file=sys.stderr,
+            )
+        prompts = capped
+
+    recorder = _FFNRecorder(save_tensors=args.save_tensors)
     handles = register_ffn_hooks(model, recorder, layer_indices=args.layers)
 
     layer_desc = f"layers {args.layers}" if args.layers is not None else "all layers"
     print(
-        f"Registered hooks on {len(handles) // 3} layer(s) ({layer_desc}).",
+        f"Registered hooks on {len(handles) // 2} layer(s) ({layer_desc}).",
         file=sys.stderr,
     )
 
@@ -323,7 +442,19 @@ def main(argv=None) -> None:
         max_tokens=args.max_tokens,
         temperature=0.0,
     )
-    llm.generate(args.prompts, sampling_params)
+
+    # Process prompts in batches to bound peak RAM.  The recorder accumulates
+    # statistics across all batches; neuron_activity is the mean over all tokens.
+    batch_size = max(1, args.batch_size)
+    for start in range(0, len(prompts), batch_size):
+        batch = prompts[start : start + batch_size]
+        llm.generate(batch, sampling_params, use_tqdm=False)
+        print(
+            f"  {min(start + batch_size, len(prompts))}/{len(prompts)} prompts processed",
+            end="\r",
+            file=sys.stderr,
+        )
+    print(file=sys.stderr)  # newline after progress
 
     for h in handles:
         h.remove()

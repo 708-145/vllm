@@ -20,7 +20,7 @@ must be registered **before** the first inference call.
 ```python
 from vllm import LLM, SamplingParams
 
-llm = LLM(model="meta-llama/Llama-3.2-1B", enforce_eager=True)
+llm = LLM(model="ibm-granite/granite-4.2-3b", enforce_eager=True)
 
 # Reach the underlying nn.Module
 # The exact path depends on the executor backend; this works for the
@@ -41,13 +41,13 @@ for name, _ in model.named_modules():
 ### Recording FFN inputs and outputs
 
 The example below captures the input and output of every layer's MLP for a
-Llama-style model (gate/up projection merged into `gate_up_proj`, down
+Granite-style model (gate/up projection merged into `gate_up_proj`, down
 projection as `down_proj`). The same pattern applies to any other submodule.
 
 ```python
 from vllm import LLM, SamplingParams
 
-llm = LLM(model="meta-llama/Llama-3.2-1B", enforce_eager=True)
+llm = LLM(model="ibm-granite/granite-4.2-3b", enforce_eager=True)
 model = llm.llm_engine.model_executor.driver_worker.model_runner.model
 
 captured: dict[str, list] = {}
@@ -130,56 +130,77 @@ must be installed inside `.venv/` via `uv pip`.
 
 #### What is recorded
 
-For each instrumented transformer layer the script captures four quantities:
+For each instrumented transformer layer the script records:
 
 | Key in `.npz` | Shape | Description |
 | --- | --- | --- |
 | `layer<N>/gate_up_input` | `[T, H]` | Hidden states entering the MLP (`H` = hidden size, `T` = total tokens) |
-| `layer<N>/gate_raw` | `[T, I]` | Raw gate projection output before SiluAndMul (`I` = intermediate size) |
-| `layer<N>/up_raw` | `[T, I]` | Raw up projection output before SiluAndMul |
-| `layer<N>/down_input` | `[T, I]` | Post-SiluAndMul activations — the hidden-dimension activity vector |
+| `layer<N>/down_input` | `[T, I]` | Post-SiluAndMul activations that feed `down_proj` (`I` = intermediate size) |
 | `layer<N>/neuron_activity` | `[I]` | Mean absolute value of `down_input` across all `T` tokens |
 
-`down_input` (equivalently `neuron_activity`) is the most informative quantity
-for understanding which intermediate neurons respond to a given input: a
-neuron with high mean absolute activation participated strongly in the MLP
-computation for those tokens.
+Pass `--no-save-tensors` to drop the per-token matrices and keep only
+`neuron_activity` — useful when processing large calibration sets where
+storing every token tensor would exhaust RAM.
 
 #### Command line
 
 ```bash
 # Record all layers, 1 generated token per prompt
 .venv/bin/python tools/profiler/record_ffn_activations.py \
-    --model meta-llama/Llama-3.2-1B \
+    --model ibm-granite/granite-4.2-3b \
     --prompts "The capital of France is" "Once upon a time" \
     --output ffn_activations.npz
 
 # Record only layers 0 and 15 (reduces memory and file size)
 .venv/bin/python tools/profiler/record_ffn_activations.py \
-    --model meta-llama/Llama-3.2-1B \
+    --model ibm-granite/granite-4.2-3b \
     --prompts "Hello world" \
     --layers 0 15 \
     --output ffn_activations.npz
 
 # Generate 16 tokens and record all layers
 .venv/bin/python tools/profiler/record_ffn_activations.py \
-    --model meta-llama/Llama-3.2-1B \
+    --model ibm-granite/granite-4.2-3b \
     --prompts "Explain quantum computing" \
     --max-tokens 16 \
+    --output ffn_activations.npz
+
+# Sample 128 random chunks from a calibration set
+.venv/bin/python tools/profiler/record_ffn_activations.py \
+    --model ibm-granite/granite-4.2-3b \
+    --calibration-set bartowski-imatrix-v5-semantic.txt \
+    --num-chunks 128 \
+    --seed 42 \
+    --output ffn_activations.npz
+
+# Use all chunks from a calibration set (no sampling)
+.venv/bin/python tools/profiler/record_ffn_activations.py \
+    --model ibm-granite/granite-4.2-3b \
+    --calibration-set bartowski-imatrix-v5-semantic.txt \
     --output ffn_activations.npz
 ```
 
 Full option reference:
 
 ```
---model          Model name or local path (required)
---prompts        One or more prompt strings (required)
---layers N …     Layer indices to record; omit to record all layers
---max-tokens     Number of new tokens to generate per prompt (default: 1)
---output         Output .npz path (default: ffn_activations.npz)
---dtype          Model dtype, e.g. float16, bfloat16, auto (default: auto)
---kv-cache-gb    KV cache size in GiB (default: 1.0); keep small on CPU/Mac
---max-model-len  Maximum sequence length (default: 2048)
+--model                Model name or local path (required)
+--prompts              One or more prompt strings (mutually exclusive with --calibration-set)
+--calibration-set FILE Path to a text file; every non-empty line is one chunk/prompt
+                       (mutually exclusive with --prompts)
+--num-chunks N         Randomly sample N chunks from --calibration-set; omit to use all
+--seed S               Random seed for --num-chunks sampling (default: no fixed seed)
+--chunk-len N          Truncate each prompt/chunk to at most N tokens before inference
+                       (default: 512); set to 0 to disable truncation
+--batch-size N         Prompts per generate() call (default: 1); increase for throughput
+                       at the cost of higher peak RAM
+--no-save-tensors      Skip per-token tensors (gate_up_input, down_input);
+                       record only neuron_activity. Reduces RAM for large calibration sets.
+--layers N …           Layer indices to record; omit to record all layers
+--max-tokens           Number of new tokens to generate per prompt (default: 1)
+--output               Output .npz path (default: ffn_activations.npz)
+--dtype                Model dtype, e.g. float16, bfloat16, auto (default: auto)
+--kv-cache-gb          KV cache size in GiB (default: 1.0); keep small on CPU/Mac
+--max-model-len        Maximum sequence length (default: 2048)
 ```
 
 !!! note
@@ -287,7 +308,7 @@ use with NVIDIA Nsight Systems. It does **not** record actual tensor values.
 === "CLI"
 
     ```bash
-    vllm serve meta-llama/Llama-3.1-8B \
+    vllm serve ibm-granite/granite-4.2-3b \
         --enable-layerwise-nvtx-tracing \
         --no-enable-chunked-prefill
     ```
@@ -299,7 +320,7 @@ use with NVIDIA Nsight Systems. It does **not** record actual tensor values.
     from vllm.config import ObservabilityConfig
 
     llm = LLM(
-        model="meta-llama/Llama-3.1-8B",
+        model="ibm-granite/granite-4.2-3b",
         observability_config=ObservabilityConfig(enable_layerwise_nvtx_tracing=True),
         enforce_eager=True,  # required: disables CUDA graphs
     )
@@ -312,7 +333,7 @@ one at exit (with output shapes). The range payload is a JSON-formatted string:
 
 ```json
 {
-  "Module": "LlamaModel.layers.0.mlp.gate_up_proj",
+  "Module": "GraniteModel.layers.0.mlp.gate_up_proj",
   "TrainableParams": {"weight": [8192, 4096]},
   "Inputs": [[2048, 4096]],
   "StaticParams": {"in_features": 4096, "out_features": 8192}
@@ -326,7 +347,7 @@ Ranges are visible in the Nsight Systems timeline under the Python thread.
 ```bash
 nsys profile \
     --trace=cuda,nvtx,osrt \
-    --output=llama_profile \
+    --output=granite_profile \
     python my_inference_script.py
 ```
 
