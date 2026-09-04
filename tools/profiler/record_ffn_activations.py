@@ -128,28 +128,48 @@ class _FFNRecorder:
 
     # -- results -------------------------------------------------------------
 
-    def to_numpy(self) -> dict[str, np.ndarray]:
-        """Concatenate temp files into final arrays and clean up."""
-        results: dict[str, np.ndarray] = {}
+    def save(self, output_path: Path) -> dict[str, tuple]:
+        """Concatenate temp files one layer at a time and write to a .npz.
+
+        Processes one layer at a time so peak RAM is bounded to the largest
+        single layer's tensors rather than the full dataset.  Returns a
+        summary dict mapping key -> shape for reporting.
+        """
+        import io
+        import zipfile
+
+        summary: dict[str, tuple] = {}
         all_layers = sorted(self._act_count)
 
-        for layer_idx in all_layers:
-            prefix = f"layer{layer_idx}"
+        # np.savez writes a zip archive; we build it ourselves so we can
+        # flush each array immediately after writing rather than holding
+        # all arrays in memory simultaneously.
+        with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            for layer_idx in all_layers:
+                prefix = f"layer{layer_idx}"
 
-            if self.save_tensors and layer_idx in self._tmp:
-                for key, paths in self._tmp[layer_idx].items():
-                    chunks = [np.load(p) for p in paths]
-                    results[f"{prefix}/{key}"] = np.concatenate(chunks, axis=0)
-                    for p in paths:
-                        os.unlink(p)
+                if self.save_tensors and layer_idx in self._tmp:
+                    for key, paths in self._tmp[layer_idx].items():
+                        arr = np.concatenate([np.load(p) for p in paths], axis=0)
+                        for p in paths:
+                            os.unlink(p)
+                        npz_key = f"{prefix}/{key}.npy"
+                        buf = io.BytesIO()
+                        np.save(buf, arr)
+                        zf.writestr(npz_key, buf.getvalue())
+                        summary[f"{prefix}/{key}"] = arr.shape
+                        del arr, buf
 
-            # neuron_activity is always written
-            count = self._act_count[layer_idx]
-            results[f"{prefix}/neuron_activity"] = (
-                self._act_sum[layer_idx] / count
-            )
+                # neuron_activity
+                arr = self._act_sum[layer_idx] / self._act_count[layer_idx]
+                npz_key = f"{prefix}/neuron_activity.npy"
+                buf = io.BytesIO()
+                np.save(buf, arr)
+                zf.writestr(npz_key, buf.getvalue())
+                summary[f"{prefix}/neuron_activity"] = arr.shape
+                del arr, buf
 
-        return results
+        return summary
 
 
 # ---------------------------------------------------------------------------
@@ -468,19 +488,16 @@ def main(argv=None) -> None:
     for h in handles:
         h.remove()
 
-    # Delete the model before concatenating temp files — frees the largest
-    # block of RAM before the (potentially large) final concatenation.
+    # Delete the model before collecting results — frees the largest block
+    # of RAM before the final concatenation and write step.
     del model, llm
 
-    results = recorder.to_numpy()
-
     output_path = Path(args.output)
-    np.savez(output_path, **results)
-    print(f"Saved {len(results)} arrays to {output_path}", file=sys.stderr)
+    summary = recorder.save(output_path)
+    print(f"Saved {len(summary)} arrays to {output_path}", file=sys.stderr)
 
-    # Print a brief summary
-    for key, arr in sorted(results.items()):
-        print(f"  {key}: shape={arr.shape} dtype={arr.dtype}")
+    for key, shape in sorted(summary.items()):
+        print(f"  {key}: shape={shape}")
 
 
 if __name__ == "__main__":

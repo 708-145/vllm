@@ -63,7 +63,7 @@ def cosine_similarity_matrix(a: np.ndarray) -> np.ndarray:
     return a_norm @ a_norm.T
 
 
-def binarise(acts: np.ndarray, threshold_pct: float) -> np.ndarray:
+def binarise_pct(acts: np.ndarray, threshold_pct: float) -> np.ndarray:
     """Return boolean mask: True where |act| exceeds the per-token percentile.
 
     Args:
@@ -76,6 +76,25 @@ def binarise(acts: np.ndarray, threshold_pct: float) -> np.ndarray:
     """
     thresholds = np.percentile(np.abs(acts), threshold_pct, axis=1, keepdims=True)
     return np.abs(acts) > thresholds
+
+
+def binarise_mult(
+    acts: np.ndarray,
+    multiplier: float,
+    global_median: float,
+) -> np.ndarray:
+    """Return boolean mask: True where |act| exceeds multiplier × global_median.
+
+    Args:
+        acts: shape [T, I] float32 activation matrix.
+        multiplier: threshold = multiplier × global_median.
+        global_median: median of |training activations|, computed once from
+            the library split and reused for both library and eval.
+
+    Returns:
+        Boolean array of shape [T, I].
+    """
+    return np.abs(acts) > multiplier * global_median
 
 
 def predict_masks(
@@ -186,11 +205,24 @@ def _parse_args(argv=None) -> argparse.Namespace:
         "--threshold-pct",
         nargs="+",
         type=float,
-        default=[70.0],
+        default=None,
         metavar="P",
-        help="Percentile threshold for binarising activations (default: 70). "
-        "Neurons above this percentile of |activation| are considered active. "
-        "Multiple values produce a sweep.",
+        help="Per-token percentile threshold (0–100). Neurons whose |activation| "
+        "exceeds this percentile of their own token are considered active. "
+        "E.g. 70 → top-30%% of neurons per token. Multiple values produce a sweep. "
+        "Mutually exclusive with --threshold-mult.",
+    )
+    p.add_argument(
+        "--threshold-mult",
+        nargs="+",
+        type=float,
+        default=None,
+        metavar="M",
+        help="Global-median multiplier threshold. Neurons whose |activation| "
+        "exceeds M × median(|train_activations|) are considered active. "
+        "E.g. 3 5 10 sweeps three thresholds. "
+        "Mutually exclusive with --threshold-pct. "
+        "If neither flag is given, defaults to --threshold-mult 3 5 10.",
     )
     p.add_argument(
         "--output-csv",
@@ -213,6 +245,13 @@ def _available_layers(data: np.lib.npyio.NpzFile) -> list[int]:
 
 def main(argv=None) -> None:
     args = _parse_args(argv)
+
+    if args.threshold_pct is not None and args.threshold_mult is not None:
+        print(
+            "ERROR: --threshold-pct and --threshold-mult are mutually exclusive.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     data = np.load(args.input)
     all_layers = _available_layers(data)
@@ -263,13 +302,27 @@ def main(argv=None) -> None:
         train_acts = acts[:n_train]
         eval_acts = acts[n_train:]
 
+        # Resolve which threshold mode and values to sweep
+        use_mult = args.threshold_mult is not None or args.threshold_pct is None
+        if use_mult:
+            thresh_values = args.threshold_mult if args.threshold_mult is not None else [3.0, 5.0, 10.0]
+            global_median: float = float(np.median(np.abs(train_acts)))
+            thresh_label = "mult"
+            header_thresh = "     mult"
+        else:
+            thresh_values = args.threshold_pct  # type: ignore[assignment]
+            global_median = 0.0  # unused in pct mode
+            thresh_label = "pct"
+            header_thresh = "  thresh%"
+
         print(
             f"\nLayer {layer_idx}:  {T} tokens  "
             f"(library={n_train}, eval={n_eval}),  "
             f"H={inputs.shape[1]},  I={acts.shape[1]}"
+            + (f"  median|act|={global_median:.4f}" if use_mult else "")
         )
         print(
-            f"  {'K':>4}  {'thresh%':>8}  "
+            f"  {'K':>4}  {header_thresh}  "
             f"{'recall':>8}  {'precision':>10}  {'density':>8}"
         )
         print("  " + "-" * 46)
@@ -281,20 +334,28 @@ def main(argv=None) -> None:
         eval_norms = np.where(eval_norms == 0, 1e-9, eval_norms)
         sim = (eval_inputs / eval_norms) @ (train_inputs / train_norms).T  # [Q, L]
 
-        for threshold_pct, top_k in product(args.threshold_pct, args.top_k):
-            train_masks = binarise(train_acts, threshold_pct)
-            eval_masks = binarise(eval_acts, threshold_pct)
+        for thresh, top_k in product(thresh_values, args.top_k):
+            top_k = int(top_k)
+            if use_mult:
+                train_masks = binarise_mult(train_acts, thresh, global_median)
+                eval_masks  = binarise_mult(eval_acts,  thresh, global_median)
+                thresh_col  = f"{thresh:>8.1f}x"
+            else:
+                train_masks = binarise_pct(train_acts, thresh)
+                eval_masks  = binarise_pct(eval_acts,  thresh)
+                thresh_col  = f"{thresh:>8.1f}"
+
             masks_pred = predict_masks(
                 eval_inputs, eval_masks, train_masks, top_k, sim=sim
             )
             metrics = evaluate(eval_masks, masks_pred)
 
-            mean_recall = metrics["recall"].mean()
+            mean_recall    = metrics["recall"].mean()
             mean_precision = metrics["precision"].mean()
-            mean_density = metrics["density"].mean()
+            mean_density   = metrics["density"].mean()
 
             print(
-                f"  {top_k:>4}  {threshold_pct:>8.1f}  "
+                f"  {top_k:>4}  {thresh_col}  "
                 f"{mean_recall:>8.3f}  {mean_precision:>10.3f}  "
                 f"{mean_density:>8.3f}"
             )
@@ -306,7 +367,7 @@ def main(argv=None) -> None:
                             "layer": layer_idx,
                             "token": n_train + token_idx,
                             "top_k": top_k,
-                            "threshold_pct": threshold_pct,
+                            thresh_label: thresh,
                             "recall": float(metrics["recall"][token_idx]),
                             "precision": float(metrics["precision"][token_idx]),
                             "density": float(metrics["density"][token_idx]),
