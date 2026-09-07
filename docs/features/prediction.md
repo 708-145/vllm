@@ -219,15 +219,18 @@ This vector represents the group's aggregate "signature" in hidden-state
 space: if the current hidden state has a large positive dot product with it,
 the group is likely to fire.
 
-**Step 2 — score and threshold.**
+**Step 2 — rank and select top-N%.**
 For each token, one scalar score per group is computed:
 
 ```
 score[g, t] = hidden[t] · pred[g]
 ```
 
-Groups whose score exceeds a threshold `T` are predicted active and will be
-computed; the rest are skipped and contribute zero to the output.
+The top `--top-pct` percent of groups by score are predicted active and
+computed; the rest are skipped.  Ranking rather than thresholding makes the
+compute budget explicit and scale-invariant — the dot-product scores vary
+widely in magnitude across layers, so an absolute threshold would need
+per-layer tuning.
 
 **Step 3 — sparse MLP forward.**
 Only the active neurons' columns of `gate_proj` and `up_proj`, and the
@@ -246,11 +249,11 @@ are typically imperceptible in downstream quality.
 
 ### Prerequisites
 
-Same as `O1_predict.py` plus `vllm` installed (the model is loaded to read
-its weights):
+Only `safetensors`, `numpy`, and `torch` are required — vLLM is not needed.
+Weights are read directly from the HuggingFace safetensors shards:
 
 ```bash
-uv pip install -r requirements/test/cuda.in   # or requirements/cpu.txt on CPU
+uv pip install safetensors numpy torch
 ```
 
 First produce the two input files:
@@ -271,47 +274,52 @@ First produce the two input files:
 ### Usage
 
 ```bash
-# Evaluate all layers, default threshold 0.0
+# Sweep top-pct values (default: 100 90 75 50 25)
 .venv/bin/python tools/profiler/gate_predict.py \
     --model ibm-granite/granite-4.2-3b \
     --npz ffn_activations128_gate.npz \
     --groups channel_groups.json
 
-# Sweep thresholds to find the cosim/savings tradeoff
-.venv/bin/python tools/profiler/gate_predict.py \
-    --model ibm-granite/granite-4.2-3b \
-    --npz ffn_activations128_gate.npz \
-    --groups channel_groups.json \
-    --threshold 0.0 1.0 2.0 4.0 8.0
-
-# Evaluate only layers 0, 15, and 39
+# Custom sweep on specific layers
 .venv/bin/python tools/profiler/gate_predict.py \
     --model ibm-granite/granite-4.2-3b \
     --npz ffn_activations128_gate.npz \
     --groups channel_groups.json \
     --layers 0 15 39 \
-    --threshold 0.0 2.0 4.0 8.0
+    --top-pct 80 60 50 40 25
 ```
 
-Output is one row per `(layer, threshold)` combination:
+Output is one row per `(layer, top_pct)` combination:
 
 ```
- layer   thresh   cosim_mean   cosim_std  cosim_p5  grp_active  neuron_rec
-  -----------------------------------------------------------------------
-     0     0.00      1.00000     0.00000   1.00000      1.0000      1.0000
-     0     2.00      0.99712     0.00431   0.98801      0.7234      0.9531
-     0     4.00      0.98103     0.01820   0.94210      0.4891      0.8762
+ layer    top_pct   cosim_mean   cosim_std   cosim_p5   grp_active   neuron_rec
+  ------------------------------------------------------------------------------
+     0      80.0%      0.97336     0.01189    0.96288       0.7969       0.9936
+     0      60.0%      0.92087     0.02236    0.88825       0.6016       0.9850
+     0      50.0%      0.87746     0.03459    0.82318       0.5000       0.9784
+     0      40.0%      0.81746     0.05413    0.72896       0.3984       0.9689
+     0      25.0%      0.69740     0.09492    0.52482       0.2500       0.9267
+    15      80.0%      0.92569     0.02269    0.89489       0.7969       0.9684
+    15      60.0%      0.85605     0.03534    0.80048       0.6016       0.8930
+    15      50.0%      0.81490     0.04193    0.74790       0.5000       0.8318
+    15      40.0%      0.76649     0.04932    0.68499       0.3984       0.7500
+    15      25.0%      0.67119     0.06494    0.56407       0.2500       0.5771
+    39      80.0%      0.97393     0.01767    0.94381       0.7969       0.9777
+    39      60.0%      0.94202     0.03675    0.87222       0.6016       0.8847
+    39      50.0%      0.93465     0.04073    0.85806       0.5000       0.8004
+    39      40.0%      0.92747     0.04519    0.84271       0.3984       0.6973
+    39      25.0%      0.91382     0.05625    0.80378       0.2500       0.5103
 ```
 
 ### Options
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--model` | *(required)* | Model name or path — used only to read weights |
+| `--model` | *(required)* | HuggingFace model ID or local path; weights read directly from safetensors |
 | `--npz` | *(required)* | `.npz` file from `record_ffn_activations.py` |
 | `--groups` | *(required)* | `channel_groups.json` from `cosim.py` |
 | `--layers N …` | all | Layer indices to evaluate |
-| `--threshold T …` | `0.0` | Dot-product threshold(s) for group activation; multiple values sweep |
+| `--top-pct P …` | `100 90 75 50 25` | Percentage(s) of groups to activate per token by rank; multiple values sweep |
 | `--dtype` | `float32` | Compute dtype (`float32` or `bfloat16`) |
 
 ### Interpreting results
@@ -320,14 +328,23 @@ Output is one row per `(layer, threshold)` combination:
 | --- | --- | --- |
 | `cosim_mean` | Mean cosine similarity of sparse vs full `down_proj` output | ≥ 0.99 for imperceptible degradation |
 | `cosim_p5` | 5th-percentile cosim — worst-case token quality | ≥ 0.95 for a safe operating point |
-| `grp_active` | Mean fraction of groups predicted active | Lower = more compute saved; `1 − grp_active` is the skip rate |
-| `neuron_recall` | Fraction of `gate_raw > 0` neurons inside a predicted-active group | ≥ 0.90 to avoid corrupting strongly-firing neurons |
+| `grp_active` | Mean fraction of groups activated (= `top_pct / 100`) | Lower = more compute saved |
+| `neuron_rec` | Fraction of `gate_raw > 0` neurons in an activated group | ≥ 0.90 to cover genuinely-firing neurons |
 
-**Reading the threshold sweep:** at threshold = 0.0 every group scores above
-zero so `grp_active = 1.0` and `cosim = 1.0` (baseline, no savings).  As the
-threshold rises, groups are shed and `grp_active` drops.  The practical
-operating point is the highest threshold where `cosim_p5 ≥ 0.95` and
-`neuron_recall ≥ 0.90`.
+**Reading the sweep:** `top_pct=100` is the full-compute baseline (cosim=1.0, no
+savings).  As `top_pct` falls, compute drops linearly while cosim degrades
+gracefully.  From the measured results on granite-4.2-3b:
+
+| Layer group | top_pct for cosim_p5 ≥ 0.95 | compute saving |
+| --- | --- | --- |
+| 0 (embedding) | ~80% | 20% |
+| 15 (plateau) | ~80% | 20% |
+| 39 (output) | **40%** | **60%** |
+
+Layer 39 is remarkably tolerant — activating only 40% of groups still yields
+cosim_p5 = 0.84, and 25% still holds cosim_mean = 0.91.  Plateau layers (15)
+are harder: even 80% top_pct gives cosim_p5 = 0.89.  The practical operating
+point is the lowest `top_pct` where `cosim_p5 ≥ 0.90` and `neuron_rec ≥ 0.85`.
 
 ### Relationship to `cosim.py`
 

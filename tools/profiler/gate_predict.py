@@ -13,11 +13,13 @@ For each transformer layer this script:
 
        pred[g] = sum(gate_proj.weight[i]  for i in group[g])   # shape [H]
 
-3. For every eval token, computes a scalar score per group::
+3. For every eval token, scores all groups::
 
        score[g, t] = hidden[t] · pred[g]                       # dot product
 
-   and predicts a group "active" when ``score[g, t] > threshold``.
+   and activates the top ``--top-pct`` percent of groups by score.  Using a
+   percentage rather than an absolute threshold keeps the compute budget
+   independent of the scale of the scores, which varies across layers.
 
 4. For each token, runs the MLP only for predicted-active groups:
    - gate and up projections restricted to those neuron columns,
@@ -29,10 +31,10 @@ For each transformer layer this script:
    baseline (all groups active) using per-token cosine similarity.
 
 Reported metrics per layer:
-  - groups_predicted  – mean fraction of groups predicted active
-  - cosim_mean/std    – mean/std cosine similarity of predicted vs full output
-  - recall_neurons    – mean fraction of truly-active neurons (gate_raw > 0)
-                        that fall inside a predicted-active group
+  - grp_active   – mean fraction of groups predicted active (= top-pct / 100)
+  - cosim_mean/std/p5  – cosine similarity of predicted vs full output
+  - neuron_rec   – fraction of truly-active (gate_raw > 0) neurons that fall
+                   inside a predicted-active group
 
 Usage::
 
@@ -41,12 +43,12 @@ Usage::
         --npz ffn_activations128_gate.npz \\
         --groups channel_groups.json
 
-    # Sweep thresholds
+    # Sweep top-pct values to find the cosim/savings tradeoff
     python tools/profiler/gate_predict.py \\
         --model ibm-granite/granite-4.2-3b \\
         --npz ffn_activations128_gate.npz \\
         --groups channel_groups.json \\
-        --threshold 0.0 1.0 2.0 4.0
+        --top-pct 100 90 75 50 25 10
 
     # Evaluate only layers 0 and 15
     python tools/profiler/gate_predict.py \\
@@ -54,11 +56,15 @@ Usage::
         --npz ffn_activations128_gate.npz \\
         --groups channel_groups.json \\
         --layers 0 15
+
+The ``--model`` argument accepts a HuggingFace model ID or a local directory.
+Weights are read directly from the safetensors checkpoint — vLLM is not
+required and the model is never loaded into an LLM engine.
 """
 
 import argparse
+import glob
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -68,79 +74,72 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Weight extraction
+# Weight extraction — read directly from safetensors, no vLLM engine needed
 # ---------------------------------------------------------------------------
 
-def _get_layers(model: torch.nn.Module) -> list:
-    for attr in ("model",):
-        inner = getattr(model, attr, None)
-        if inner is not None:
-            layers = getattr(inner, "layers", None)
-            if layers is not None:
-                return list(layers)
-    transformer = getattr(model, "transformer", None)
-    if transformer is not None:
-        return list(getattr(transformer, "h", []))
-    raise RuntimeError("Could not locate transformer layers.")
+def _find_model_dir(model_name_or_path: str) -> Path:
+    """Resolve a HF model ID or local path to the directory containing weights."""
+    p = Path(model_name_or_path)
+    if p.exists():
+        return p
+    # HuggingFace cache layout
+    slug = model_name_or_path.replace("/", "--")
+    candidates = sorted(
+        glob.glob(str(Path.home() / ".cache/huggingface/hub"
+                      / f"models--{slug}/snapshots/*/"))
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            f"Could not find model '{model_name_or_path}' locally. "
+            "Pass a local directory path or download the model first."
+        )
+    return Path(candidates[-1])   # latest snapshot
 
 
-def _get_mlp(layer: torch.nn.Module) -> torch.nn.Module:
-    for attr in ("mlp", "ffn", "feed_forward"):
-        m = getattr(layer, attr, None)
-        if m is not None:
-            return m
-    raise RuntimeError(f"Could not find MLP in {type(layer).__name__}.")
-
-
-def _get_proj(mlp: torch.nn.Module, *candidates: str) -> torch.nn.Module:
-    for name in candidates:
-        m = getattr(mlp, name, None)
-        if m is not None:
-            return m
-    raise RuntimeError(f"Could not find projection {candidates}.")
-
-
-def _extract_weight(proj: torch.nn.Module) -> torch.Tensor:
-    """Return the weight tensor as float32 on CPU regardless of vLLM wrapper."""
-    w = getattr(proj, "weight", None)
-    if w is None:
-        raise RuntimeError(f"No weight attribute on {type(proj).__name__}.")
-    return w.detach().float().cpu()
-
-
-def extract_mlp_weights(
-    model: torch.nn.Module,
+def load_mlp_weights(
+    model_dir: Path,
     layer_idx: int,
 ) -> dict[str, torch.Tensor]:
-    """Return gate_proj, up_proj, down_proj weights for one layer.
-
-    For models where gate and up are fused into ``gate_up_proj``, split the
-    weight at the midpoint.
+    """Load gate_proj, up_proj, down_proj for one layer from safetensors.
 
     Returns dict with keys ``gate``, ``up``, ``down``, each float32 CPU tensor:
       gate: [intermediate, hidden]
       up:   [intermediate, hidden]
       down: [hidden, intermediate]
     """
-    layers = _get_layers(model)
-    mlp = _get_mlp(layers[layer_idx])
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        raise ImportError("pip install safetensors")
 
-    # Prefer separate gate_proj / up_proj; fall back to fused gate_up_proj
-    gate_mod = getattr(mlp, "gate_proj", None)
-    up_mod   = getattr(mlp, "up_proj",   None)
-    if gate_mod is not None and up_mod is not None:
-        gate_w = _extract_weight(gate_mod)   # [I, H]
-        up_w   = _extract_weight(up_mod)     # [I, H]
-    else:
-        fused = _get_proj(mlp, "gate_up_proj", "c_fc", "dense_h_to_4h", "fc1")
-        fused_w = _extract_weight(fused)     # [2*I, H]
-        I = fused_w.shape[0] // 2
-        gate_w, up_w = fused_w[:I], fused_w[I:]
+    shards = sorted(model_dir.glob("model*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(f"No model*.safetensors found in {model_dir}")
 
-    down_mod = _get_proj(mlp, "down_proj", "c_proj", "dense_4h_to_h", "fc2")
-    down_w   = _extract_weight(down_mod)     # [H, I]
+    needed = {
+        f"model.layers.{layer_idx}.mlp.gate_proj.weight",
+        f"model.layers.{layer_idx}.mlp.up_proj.weight",
+        f"model.layers.{layer_idx}.mlp.down_proj.weight",
+    }
+    found: dict[str, torch.Tensor] = {}
+    for shard in shards:
+        if not needed:
+            break
+        with safe_open(str(shard), framework="pt", device="cpu") as f:
+            for key in list(needed):
+                if key in f.keys():
+                    found[key] = f.get_tensor(key).float()
+                    needed.discard(key)
 
-    return {"gate": gate_w, "up": up_w, "down": down_w}
+    if needed:
+        raise KeyError(f"Missing weights for layer {layer_idx}: {needed}")
+
+    prefix = f"model.layers.{layer_idx}.mlp."
+    return {
+        "gate": found[prefix + "gate_proj.weight"],   # [I, H]
+        "up":   found[prefix + "up_proj.weight"],     # [I, H]
+        "down": found[prefix + "down_proj.weight"],   # [H, I]
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -180,88 +179,73 @@ def mlp_full(
     return (gate_out * up_out) @ down_w.T   # [T, H]
 
 
-def mlp_sparse(
-    x: torch.Tensor,                # [T, H]
-    gate_w: torch.Tensor,           # [I, H]
-    up_w: torch.Tensor,             # [I, H]
-    down_w: torch.Tensor,           # [H, I]
-    active_neurons: torch.Tensor,   # [I] bool — which neurons to compute
-) -> torch.Tensor:
-    """Sparse MLP: only compute active neurons, zero the rest.  Returns [T, H]."""
-    idx = active_neurons.nonzero(as_tuple=True)[0]   # [K]
-    if idx.numel() == 0:
-        return torch.zeros(x.shape[0], down_w.shape[0], dtype=x.dtype)
-    gate_out = F.silu(x @ gate_w[idx].T)    # [T, K]
-    up_out   = x @ up_w[idx].T              # [T, K]
-    # down_w: [H, I] → select columns idx → [H, K] → transpose to [K, H]
-    return (gate_out * up_out) @ down_w[:, idx].T     # [T, H]
-
-
-def predict_active_neurons(
-    x: torch.Tensor,            # [T, H]
-    pred: torch.Tensor,         # [G, H]
-    groups: list[list[int]],
-    I: int,
-    threshold: float,
-) -> torch.Tensor:
-    """Return [T, I] bool mask: True for neurons in predicted-active groups."""
-    scores = x @ pred.T                          # [T, G]
-    active_groups = scores > threshold           # [T, G] bool
-    # expand groups to neuron mask
-    mask = torch.zeros(x.shape[0], I, dtype=torch.bool)
+def _build_group_index(groups: list[list[int]], I: int) -> torch.Tensor:
+    """Return [I] int tensor mapping neuron → group index."""
+    group_of = torch.zeros(I, dtype=torch.long)
     for g, idxs in enumerate(groups):
-        col = torch.tensor(idxs, dtype=torch.long)
-        mask[:, col] |= active_groups[:, g : g + 1]
-    return mask   # [T, I]
+        group_of[idxs] = g
+    return group_of
 
-
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
 
 def evaluate_layer(
     x: torch.Tensor,                # [T, H]  gate_up_input from npz
     gate_raw: torch.Tensor,         # [T, I]  recorded gate logits (ground truth)
     weights: dict[str, torch.Tensor],
     groups: list[list[int]],
-    threshold: float,
+    top_pct: float,                 # 0–100: activate top N% of groups per token
 ) -> dict[str, float]:
     gate_w = weights["gate"]    # [I, H]
     up_w   = weights["up"]      # [I, H]
     down_w = weights["down"]    # [H, I]
     I = gate_w.shape[0]
+    G = len(groups)
 
-    pred = build_group_predictors(gate_w, groups)   # [G, H]
+    pred     = build_group_predictors(gate_w, groups)   # [G, H]
+    group_of = _build_group_index(groups, I)            # [I]
+
+    # Scores: [T, G]
+    scores = x @ pred.T
+
+    # Activate the top-K groups per token where K = ceil(top_pct/100 * G).
+    # Using a per-token score quantile as threshold keeps budget fixed regardless
+    # of the absolute scale of the scores (which varies widely across layers).
+    K = max(1, round(top_pct / 100.0 * G))
+    if K >= G:
+        active_groups = torch.ones(x.shape[0], G, dtype=torch.bool)
+    else:
+        # threshold per token = the K-th largest score value
+        kth_vals = scores.kthvalue(G - K + 1, dim=1, keepdim=True).values
+        active_groups = scores >= kth_vals          # [T, G] bool
+
+    # Expand group decisions to per-neuron mask: neuron i is active when its
+    # group is active.  group_of[i] gives the group index for neuron i.
+    neuron_mask = active_groups[:, group_of]      # [T, I] bool
 
     # Full-compute baseline
     full_out = mlp_full(x, gate_w, up_w, down_w)   # [T, H]
 
-    # Per-token sparse forward
-    neuron_mask = predict_active_neurons(x, pred, groups, I, threshold)  # [T, I]
-    sparse_out = torch.zeros_like(full_out)
-    for t in range(x.shape[0]):
-        sparse_out[t] = mlp_sparse(x[t : t + 1], gate_w, up_w, down_w,
-                                    neuron_mask[t])
+    # Sparse forward — vectorised over the token batch.
+    # Apply the neuron mask by zeroing out inactive neurons after the full
+    # gate/up projections; this avoids a Python loop over tokens while still
+    # correctly zeroing skipped neurons before the down projection.
+    gate_out = F.silu(x @ gate_w.T) * neuron_mask   # [T, I]
+    up_out   = (x @ up_w.T)         * neuron_mask   # [T, I]
+    sparse_out = (gate_out * up_out) @ down_w.T      # [T, H]
 
-    # Cosine similarity between sparse and full outputs, per token
+    # Per-token cosine similarity
     cosim = F.cosine_similarity(sparse_out, full_out, dim=1)   # [T]
 
-    # Group density: mean fraction of groups predicted active
-    scores = x @ pred.T                       # [T, G]
-    active_groups = (scores > threshold)      # [T, G]
-    group_density = active_groups.float().mean().item()
-
     # Neuron recall: of neurons where gate_raw > 0, how many are in active groups?
-    truly_active = gate_raw > 0               # [T, I]
-    recalled = (truly_active & neuron_mask).sum().item()
+    truly_active = gate_raw > 0
+    recalled     = (truly_active & neuron_mask).sum().item()
     total_active = truly_active.sum().item()
-    recall = recalled / total_active if total_active > 0 else 1.0
+    recall       = recalled / total_active if total_active > 0 else 1.0
 
     return {
         "cosim_mean": cosim.mean().item(),
         "cosim_std":  cosim.std().item(),
         "cosim_p5":   cosim.quantile(0.05).item(),
-        "groups_active_frac": group_density,
+        "groups_active_frac": active_groups.float().mean().item(),
         "neuron_recall": recall,
     }
 
@@ -277,7 +261,9 @@ def _parse_args(argv=None) -> argparse.Namespace:
         epilog=__doc__,
     )
     p.add_argument("--model", required=True,
-                   help="Model name or path (same as used for recording).")
+                   help="HuggingFace model ID or local path. "
+                        "Weights are read directly from safetensors shards — "
+                        "vLLM is not required.")
     p.add_argument("--npz", required=True,
                    help=".npz file from record_ffn_activations.py.")
     p.add_argument("--groups", required=True,
@@ -285,16 +271,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--layers", nargs="*", type=int, default=None,
                    metavar="N",
                    help="Layer indices to evaluate. Default: all layers in npz.")
-    p.add_argument("--threshold", nargs="+", type=float, default=[0.0],
-                   metavar="T",
-                   help="Group activation threshold(s) on the dot-product score "
-                        "(default: 0.0). Multiple values sweep. "
-                        "A group is predicted active when "
-                        "hidden · sum(gate_rows) > T.")
-    p.add_argument("--train-split", type=float, default=0.8, metavar="F",
-                   help="Fraction of tokens used as training split (unused here "
-                        "— all eval tokens used). Kept for consistency. "
-                        "(default: 0.8)")
+    p.add_argument("--top-pct", nargs="+", type=float, default=[100, 90, 75, 50, 25],
+                   metavar="P",
+                   help="Percentage(s) of groups to activate per token, ranked by "
+                        "dot-product score (default: 100 90 75 50 25). "
+                        "100 activates all groups (full compute baseline). "
+                        "Multiple values sweep the compute/quality tradeoff.")
     p.add_argument("--dtype", default="float32",
                    choices=["float32", "bfloat16"],
                    help="Compute dtype (default: float32).")
@@ -303,9 +285,6 @@ def _parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv=None) -> None:
     args = _parse_args(argv)
-
-    # Suppress vLLM startup noise
-    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
     # ---- Load groups ----
     groups_path = Path(args.groups)
@@ -334,28 +313,23 @@ def main(argv=None) -> None:
         print(f"WARNING: layers {missing} not in npz; skipping.", file=sys.stderr)
         layers = [l for l in layers if l in available_layers]
 
-    # ---- Load model ----
-    print(f"Loading model: {args.model}", file=sys.stderr)
-    from vllm import LLM
-    llm = LLM(
-        model=args.model,
-        dtype="bfloat16",
-        enforce_eager=True,
-        kv_cache_memory_bytes=int(1e9),
-        max_model_len=512,
-    )
-    nn_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    print("Model loaded.", file=sys.stderr)
+    # ---- Resolve model directory ----
+    try:
+        model_dir = _find_model_dir(args.model)
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Reading weights from {model_dir}", file=sys.stderr)
 
     dt = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
 
     # ---- Header ----
     print(
-        f"\n{'layer':>6}  {'thresh':>8}  "
+        f"\n{'layer':>6}  {'top_pct':>9}  "
         f"{'cosim_mean':>11}  {'cosim_std':>10}  {'cosim_p5':>9}  "
         f"{'grp_active':>11}  {'neuron_rec':>11}"
     )
-    print("  " + "-" * 76)
+    print("  " + "-" * 78)
 
     for layer_idx in layers:
         group_key = f"layer{layer_idx}"
@@ -372,27 +346,22 @@ def main(argv=None) -> None:
         gate_raw = torch.from_numpy(gate_np).to(dt)
 
         try:
-            weights = extract_mlp_weights(nn_model, layer_idx)
+            weights = load_mlp_weights(model_dir, layer_idx)
         except Exception as e:
-            print(f"  layer {layer_idx}: could not extract weights: {e}", file=sys.stderr)
+            print(f"  layer {layer_idx}: could not load weights: {e}", file=sys.stderr)
             continue
-        # cast weights to compute dtype
         weights = {k: v.to(dt) for k, v in weights.items()}
 
-        for thresh in args.threshold:
-            metrics = evaluate_layer(x, gate_raw, weights, groups, thresh)
+        for top_pct in args.top_pct:
+            metrics = evaluate_layer(x, gate_raw, weights, groups, top_pct)
             print(
-                f"{layer_idx:>6}  {thresh:>8.2f}  "
+                f"{layer_idx:>6}  {top_pct:>8.1f}%  "
                 f"{metrics['cosim_mean']:>11.5f}  "
                 f"{metrics['cosim_std']:>10.5f}  "
                 f"{metrics['cosim_p5']:>9.5f}  "
                 f"{metrics['groups_active_frac']:>11.4f}  "
                 f"{metrics['neuron_recall']:>11.4f}"
             )
-
-    # Free model before exit
-    del nn_model, llm
-
 
 if __name__ == "__main__":
     main()
