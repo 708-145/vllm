@@ -7,13 +7,14 @@ For each transformer layer this script captures:
   * ``gate_up_proj`` **input**  – hidden states entering the MLP,
     shape ``[num_tokens, hidden_size]``
 
-  * ``down_proj`` **input** – post-SiluAndMul activations feeding the
-    down-projection, shape ``[num_tokens, intermediate_size]``.
-    This is the *hidden-dimension activity* vector: high values indicate
-    neurons that fired strongly for the given input tokens.
+  * ``gate_up_proj`` **output (gate half)** – the raw gate logits *before*
+    the SiLU activation, shape ``[num_tokens, intermediate_size]``.
+    Stored as ``gate_raw``.  SiLU(x) ≈ 0 for x ≲ −4, so this is the
+    correct signal for identifying genuinely-inactive neurons.
 
-  * Per-neuron **mean absolute activity** (scalar per intermediate neuron,
-    averaged across all tokens) for quick analysis of neuron utilisation.
+  * Per-neuron **fraction of tokens where gate_raw > 0** (scalar per
+    intermediate neuron, averaged across all tokens) for quick analysis of
+    neuron utilisation.  Stored as ``neuron_activity``.
 
 Tensors are streamed to temporary files on disk during inference so that
 peak RAM is bounded to roughly one batch's activations regardless of how
@@ -23,7 +24,7 @@ NumPy ``.npz`` archive with keys of the form::
 
     layer<N>/<quantity>
 
-where ``<quantity>`` is one of ``gate_up_input``, ``down_input``,
+where ``<quantity>`` is one of ``gate_up_input``, ``gate_raw``,
 ``neuron_activity``.
 
 Usage::
@@ -89,7 +90,7 @@ class _FFNRecorder:
         # Temp files: layer_idx -> {key: [NamedTemporaryFile, ...]}
         self._tmp: dict[int, dict[str, list]] = {}
 
-        # Online mean of |down_input| per layer: (sum_abs, count)
+        # Online mean of (gate_raw > 0) per neuron: (sum_positive, count)
         self._act_sum: dict[int, np.ndarray] = {}
         self._act_count: dict[int, int] = {}
 
@@ -110,19 +111,25 @@ class _FFNRecorder:
 
         return _hook
 
-    def down_pre_hook(self, layer_idx: int):
-        def _hook(module, args, kwargs):
-            x = args[0].detach().float().cpu()
-            arr = x.numpy()
+    def gate_up_post_hook(self, layer_idx: int):
+        def _hook(module, args, output):
+            # vLLM's MergedColumnParallelLinear returns (tensor, bias_or_None).
+            # Unwrap to get the actual weight-matrix output.
+            tensor = output[0] if isinstance(output, tuple) else output
+            # tensor shape: [num_tokens, 2 * intermediate_size];
+            # the gate half is the first intermediate_size columns.
+            intermediate = tensor.shape[-1] // 2
+            gate = tensor[..., :intermediate].detach().float().cpu().numpy()
             if self.save_tensors:
-                self._append(layer_idx, "down_input", arr)
-            # Always update running mean of |activation|
+                self._append(layer_idx, "gate_raw", gate)
+            # Track fraction of tokens where gate logit > 0 (SiLU > 0 iff x > 0)
+            positive = (gate > 0).astype(np.float32)
             if layer_idx in self._act_sum:
-                self._act_sum[layer_idx] += np.abs(arr).sum(axis=0)
-                self._act_count[layer_idx] += arr.shape[0]
+                self._act_sum[layer_idx] += positive.sum(axis=0)
+                self._act_count[layer_idx] += gate.shape[0]
             else:
-                self._act_sum[layer_idx] = np.abs(arr).sum(axis=0)
-                self._act_count[layer_idx] = arr.shape[0]
+                self._act_sum[layer_idx] = positive.sum(axis=0)
+                self._act_count[layer_idx] = gate.shape[0]
 
         return _hook
 
@@ -160,7 +167,7 @@ class _FFNRecorder:
                         summary[f"{prefix}/{key}"] = arr.shape
                         del arr, buf
 
-                # neuron_activity
+                # neuron_activity: fraction of tokens where gate_raw > 0
                 arr = self._act_sum[layer_idx] / self._act_count[layer_idx]
                 npz_key = f"{prefix}/neuron_activity.npy"
                 buf = io.BytesIO()
@@ -223,7 +230,7 @@ def register_ffn_hooks(
     recorder: _FFNRecorder,
     layer_indices: list[int] | None = None,
 ) -> list:
-    """Register recording hooks on gate_up_proj and down_proj.
+    """Register recording hooks on gate_up_proj.
 
     Args:
         model: The loaded nn.Module (e.g. ``llm.llm_engine...model``).
@@ -245,13 +252,12 @@ def register_ffn_hooks(
         gate_up = _get_proj(
             mlp, "gate_up_proj", "gate_proj", "c_fc", "dense_h_to_4h", "fc1"
         )
-        down = _get_proj(mlp, "down_proj", "c_proj", "dense_4h_to_h", "fc2")
 
         handles += [
             gate_up.register_forward_pre_hook(
                 recorder.gate_up_pre_hook(i), with_kwargs=True
             ),
-            down.register_forward_pre_hook(recorder.down_pre_hook(i), with_kwargs=True),
+            gate_up.register_forward_hook(recorder.gate_up_post_hook(i)),
         ]
 
     if not handles:
@@ -381,7 +387,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
         dest="save_tensors",
         action="store_false",
         default=True,
-        help="Skip saving full per-token tensors (gate_up_input, down_input); "
+        help="Skip saving full per-token tensors (gate_up_input, gate_raw); "
         "record only neuron_activity. Reduces RAM usage for large calibration sets.",
     )
     return p.parse_args(argv)
@@ -466,6 +472,7 @@ def main(argv=None) -> None:
         f"Registered hooks on {len(handles) // 2} layer(s) ({layer_desc}).",
         file=sys.stderr,
     )
+    # Two handles per layer: pre-hook (gate_up_input) + post-hook (gate_raw)
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,

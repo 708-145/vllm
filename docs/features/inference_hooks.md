@@ -135,8 +135,8 @@ For each instrumented transformer layer the script records:
 | Key in `.npz` | Shape | Description |
 | --- | --- | --- |
 | `layer<N>/gate_up_input` | `[T, H]` | Hidden states entering the MLP (`H` = hidden size, `T` = total tokens) |
-| `layer<N>/down_input` | `[T, I]` | Post-SiluAndMul activations that feed `down_proj` (`I` = intermediate size) |
-| `layer<N>/neuron_activity` | `[I]` | Mean absolute value of `down_input` across all `T` tokens |
+| `layer<N>/gate_raw` | `[T, I]` | Gate logits **before** SiLU (`I` = intermediate size). `SiLU(x) ≈ 0` for `x ≲ −4`, so this is the correct sparsity signal — neurons with a strongly negative gate logit contribute negligibly to the output. |
+| `layer<N>/neuron_activity` | `[I]` | Fraction of tokens where `gate_raw > 0` for each neuron. A value near 0 means the neuron is structurally inactive on most inputs; near 1 means it fires on nearly every token. |
 
 Tensor chunks are streamed to temporary files on disk as they are observed,
 so peak RAM during inference is bounded to roughly one batch's activations
@@ -197,7 +197,7 @@ Full option reference:
                        (default: 512); set to 0 to disable truncation
 --batch-size N         Prompts per generate() call (default: 8); increase for throughput
                        at the cost of higher peak RAM
---no-save-tensors      Skip per-token tensors (gate_up_input, down_input);
+--no-save-tensors      Skip per-token tensors (gate_up_input, gate_raw);
                        record only neuron_activity. Reduces RAM for large calibration sets.
 --layers N …           Layer indices to record; omit to record all layers
 --max-tokens           Number of new tokens to generate per prompt (default: 1)
@@ -224,11 +224,18 @@ data = np.load("ffn_activations.npz")
 for key in sorted(data.files):
     print(f"{key}: {data[key].shape}")
 
-# Top-20 most active intermediate neurons in layer 0
+# Top-20 most frequently active intermediate neurons in layer 0
+# neuron_activity = fraction of tokens where gate_raw > 0
 activity = data["layer0/neuron_activity"]      # shape (intermediate_size,)
 top20 = np.argsort(activity)[-20:][::-1]
-print("Top neurons:", top20)
+print("Top neurons (by gate_raw > 0 frequency):", top20)
 print("Activity values:", activity[top20])
+
+# Distribution of gate_raw values for layer 0 (first 10 tokens)
+gate = data["layer0/gate_raw"]   # shape (T, intermediate_size)
+print(f"gate_raw:  mean={gate.mean():.4f}  "
+      f"pct_positive={( gate > 0).mean()*100:.1f}%  "
+      f"pct_below_neg4={(gate < -4).mean()*100:.1f}% (SiLU ≈ 0 here)")
 
 # Plot neuron activity for layer 0 vs layer 15
 fig, axes = plt.subplots(1, 2, figsize=(12, 3))
@@ -238,7 +245,7 @@ for ax, layer in zip(axes, [0, 15]):
         ax.bar(range(len(data[key])), data[key])
         ax.set_title(f"Layer {layer} neuron activity")
         ax.set_xlabel("Neuron index")
-        ax.set_ylabel("Mean |activation|")
+        ax.set_ylabel("Fraction of tokens (gate_raw > 0)")
 plt.tight_layout()
 plt.savefig("neuron_activity.png", dpi=150)
 ```
@@ -246,16 +253,20 @@ plt.savefig("neuron_activity.png", dpi=150)
 #### Architecture notes
 
 For **Llama / Mistral / Qwen** the gate and up projections are fused into a
-single `MergedColumnParallelLinear` called `gate_up_proj`.  Its output has
-shape `[T, 2 * intermediate_size]`; the script splits this at the midpoint into
-`gate_raw` and `up_raw` before saving.  `SiluAndMul` is applied to those two
-halves in-place inside the `LlamaMLP.forward` method — the result is what
-arrives at `down_proj` as `down_input`.
+single `MergedColumnParallelLinear` called `gate_up_proj`.  Its forward method
+returns a `(tensor, bias_or_None)` tuple; the tensor has shape
+`[T, 2 * intermediate_size]`.  The script captures the first half of that
+tensor as `gate_raw` (the gate logits, before SiLU) via a
+`register_forward_hook` on `gate_up_proj`.  The `gate_up_input` hidden state is
+captured in the matching `register_forward_pre_hook`.  The second half (up
+projection) and the post-SiLU product (`down_input`) are not recorded —
+`gate_raw` is sufficient for sparsity analysis because `SiLU(gate_raw) *
+up_raw ≈ 0` whenever `gate_raw ≲ −4`.
 
 For models that keep gate and up as separate modules (e.g. some Mixtral
 variants), the script falls back to attaching to whichever of `gate_proj` /
-`up_proj` / `c_fc` it finds first.  In that case `gate_raw` and `up_raw` in
-the output will both represent the same projection.
+`up_proj` / `c_fc` it finds first.  In that case `gate_raw` will represent
+that projection's output directly.
 
 ---
 

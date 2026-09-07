@@ -60,11 +60,13 @@ and ORs their binarised activation masks together.
                compare with true mask m_i
 ```
 
-The binary mask `m_i` is derived from `down_input` (the post-SiluAndMul
-activations) by thresholding at a per-token percentile: neurons whose
-`|activation|` exceeds the P-th percentile of that token's activation
-distribution are marked active.  A threshold of 70 marks the top-30 % of
-neurons as active.
+The binary mask `m_i` is derived from `gate_raw` (the gate logits before SiLU)
+by thresholding at a per-token percentile: neurons whose `|gate_raw|` exceeds
+the P-th percentile of that token's gate distribution are marked active.
+A threshold of 70 marks the top-30 % of neurons as active.  Using `gate_raw`
+rather than `down_input` (the post-SiLU product) gives a sharper activity
+signal: `SiLU(x) ≈ 0` for `x ≲ −4`, so neurons with strongly negative gate
+logits are genuinely inactive and form a cleaner zero-mass in the distribution.
 
 **OR is used deliberately**: a false negative (predicting a neuron inactive
 when it is actually active) corrupts the MLP output, so the predictor errs
