@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compute the cosine similarity of the down projection input channels.
+"""Compute the cosine similarity of the FFN intermediate channels.
 
 Groups intermediate FFN channels into highly similar groups of size 64.
+Reads ``gate_raw`` (gate logits before SiLU) from files produced by
+``record_ffn_activations.py``; falls back to ``down_input`` for files
+recorded before the gate_raw switch.
 """
 
 import argparse
@@ -15,20 +18,30 @@ import numpy as np
 import torch
 
 
-def load_down_input(
+def load_activation(
     data: Dict[str, np.ndarray],
     layer_idx: int,
     device: str = "cpu",
 ) -> torch.Tensor:
-    """Retrieve the down projection input activations for a layer."""
-    down_input_key = f"layer{layer_idx}/down_input"
-    if down_input_key not in data:
-        raise KeyError(
-            f"Expected key '{down_input_key}' not found in NPZ data.")
+    """Retrieve the FFN intermediate activations for a layer.
 
-    print(f"  Loading down_input for layer {layer_idx}...")
-    down_input = torch.from_numpy(data[down_input_key]).to(device).float()
-    return down_input
+    Prefers ``gate_raw`` (gate logits before SiLU, recorded by the current
+    version of ``record_ffn_activations.py``).  Falls back to ``down_input``
+    for NPZ files recorded before the gate_raw switch.
+    """
+    for key in (f"layer{layer_idx}/gate_raw", f"layer{layer_idx}/down_input"):
+        if key in data:
+            label = key.split("/")[1]
+            print(f"  Loading {label} for layer {layer_idx}...")
+            return torch.from_numpy(data[key]).to(device).float()
+    raise KeyError(
+        f"Expected key 'layer{layer_idx}/gate_raw' not found in NPZ data. "
+        f"Available keys: {[k for k in data.keys() if k.startswith(f'layer{layer_idx}')]}"
+    )
+
+
+# Backwards-compatible alias used by existing tests and callers.
+load_down_input = load_activation
 
 
 def binarise_pct(acts: torch.Tensor, threshold_pct: float) -> torch.Tensor:
@@ -308,26 +321,26 @@ def main(argv=None) -> None:
     for lyr in target_layers:
         print(f"\n--- Layer {lyr} ---", file=sys.stderr)
         try:
-            down_input = load_down_input(data, lyr, device=device)
+            activations = load_activation(data, lyr, device=device)
         except Exception as e:
-            print(f"Failed to load down_input for layer {lyr}: {e}", file=sys.stderr)
+            print(f"Failed to load activations for layer {lyr}: {e}", file=sys.stderr)
             continue
 
-        T, C = down_input.shape
+        T, C = activations.shape
         print(f"  Shape: {T} tokens, {C} channels", file=sys.stderr)
 
         if args.threshold_pct is not None:
             print(f"  Binarizing activations with threshold-pct={args.threshold_pct}...", file=sys.stderr)
-            down_input = binarise_pct(down_input, args.threshold_pct)
+            activations = binarise_pct(activations, args.threshold_pct)
 
         print("  Computing cosine similarity matrix...", file=sys.stderr)
-        sim_matrix = compute_cosine_similarity(down_input)
+        sim_matrix = compute_cosine_similarity(activations)
 
         layer_res = {}
 
         if args.method in ("kmeans", "all"):
             print("  Grouping channels (balanced k-means method)...", file=sys.stderr)
-            norm_channels = normalize_channels(down_input)
+            norm_channels = normalize_channels(activations)
             kmeans_groups = group_channels_kmeans(norm_channels, group_size=args.group_size)
             kmeans_stats = evaluate_grouping(sim_matrix, kmeans_groups)
             layer_res["kmeans"] = kmeans_stats

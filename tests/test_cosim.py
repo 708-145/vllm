@@ -36,18 +36,25 @@ def test_binarise_pct():
 
 
 def test_load_down_input():
-    # Test loading down_input from mock data dict
-    data = {
-        "layer0/down_input": np.arange(12, dtype=np.float32).reshape(3, 4)
+    # gate_raw takes priority when present
+    data_gate = {
+        "layer0/gate_raw": np.arange(12, dtype=np.float32).reshape(3, 4)
     }
-    
-    tensor = load_down_input(data, layer_idx=0, device="cpu")
+    tensor = load_down_input(data_gate, layer_idx=0, device="cpu")
     assert tensor.shape == (3, 4)
     assert torch.allclose(tensor, torch.arange(12, dtype=torch.float32).reshape(3, 4))
-    
-    # Test KeyError for missing key
-    with pytest.raises(KeyError, match="Expected key 'layer1/down_input' not found in NPZ data"):
-        load_down_input(data, layer_idx=1, device="cpu")
+
+    # Falls back to down_input for old-format files
+    data_old = {
+        "layer0/down_input": np.arange(12, dtype=np.float32).reshape(3, 4)
+    }
+    tensor = load_down_input(data_old, layer_idx=0, device="cpu")
+    assert tensor.shape == (3, 4)
+    assert torch.allclose(tensor, torch.arange(12, dtype=torch.float32).reshape(3, 4))
+
+    # KeyError when neither key is present
+    with pytest.raises(KeyError, match="Expected key 'layer1/gate_raw' not found in NPZ data"):
+        load_down_input(data_old, layer_idx=1, device="cpu")
 
 
 def test_compute_cosine_similarity():
