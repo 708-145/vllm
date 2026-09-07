@@ -41,13 +41,18 @@ def binarise_pct(acts: torch.Tensor, threshold_pct: float) -> torch.Tensor:
     return (torch.abs(acts) > thresholds).float()
 
 
-def compute_cosine_similarity(activations: torch.Tensor) -> torch.Tensor:
-    """Compute the C x C pairwise cosine similarity matrix of the channels."""
-    # activations shape: (T, C) where C is intermediate_size
+def normalize_channels(activations: torch.Tensor) -> torch.Tensor:
+    """Normalize the columns of activations to unit L2 norm."""
     norms = torch.norm(activations, dim=0, keepdim=True)
     # Avoid division by zero for inactive/dead channels
     norms = torch.where(norms == 0.0, torch.ones_like(norms), norms)
-    normalized = activations / norms
+    return activations / norms
+
+
+def compute_cosine_similarity(activations: torch.Tensor) -> torch.Tensor:
+    """Compute the C x C pairwise cosine similarity matrix of the channels."""
+    # activations shape: (T, C) where C is intermediate_size
+    normalized = normalize_channels(activations)
     similarity_matrix = torch.mm(normalized.t(), normalized)
     return similarity_matrix
 
@@ -60,13 +65,14 @@ def group_channels_greedy(similarity_matrix: torch.Tensor,
     2. Sorts candidates so dense neighborhoods are seeded first.
     3. Greedily grabs the best unassigned seed and its nearest neighbors.
     """
+    # Force CPU execution to avoid GPU/MPS synchronization latency during sequential loops
+    similarity_matrix = similarity_matrix.cpu().clone().float()
     C = similarity_matrix.shape[0]
     if C % group_size != 0:
         raise ValueError(
             f"Number of channels {C} is not divisible by group_size {group_size}"
         )
 
-    similarity_matrix = similarity_matrix.clone().float()
     unassigned = torch.ones(C, dtype=torch.bool, device=similarity_matrix.device)
     groups = []
 
@@ -94,6 +100,83 @@ def group_channels_greedy(similarity_matrix: torch.Tensor,
     return groups
 
 
+def group_channels_kmeans(
+    normalized_channels: torch.Tensor,
+    group_size: int = 64,
+    num_iters: int = 10,
+    seed: int = 42,
+) -> List[List[int]]:
+    """Group channels into equal-sized groups using Balanced K-Means.
+
+    Iteratively updates cluster centroids and assigns channels to centroids
+    respecting the size capacity constraint (exactly group_size channels per cluster).
+    """
+    import random
+    # Force CPU execution to avoid GPU/MPS synchronization latency during sequential loops
+    normalized_channels = normalized_channels.cpu()
+    C = normalized_channels.shape[1]
+    if C % group_size != 0:
+        raise ValueError(
+            f"Number of channels {C} is not divisible by group_size {group_size}"
+        )
+
+    K = C // group_size  # Number of clusters
+    device = torch.device("cpu")
+
+    # Set random seeds for reproducibility
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+    # Randomly initialize centroids by selecting K channels
+    shuffled_indices = torch.randperm(C, device=device)
+    centroids = normalized_channels[:, shuffled_indices[:K]].clone()  # (T, K)
+
+    channel_to_cluster = torch.full((C,), -1, dtype=torch.long, device=device)
+
+    for _ in range(num_iters):
+        # Compute similarity between all channels and all centroids
+        sims = torch.mm(normalized_channels.t(), centroids)
+
+        # Pre-sort centroid choices for each channel in parallel
+        sorted_centroid_indices = torch.argsort(sims, dim=1, descending=True)
+        # Convert to nested list to avoid tensor indexing and .item() overhead in Python loop
+        sorted_centroid_indices_list = sorted_centroid_indices.tolist()
+
+        channel_to_cluster.fill_(-1)
+        cluster_counts = torch.zeros(K, dtype=torch.long, device=device)
+
+        # Sort channels by their maximum similarity to any centroid (Strongest Preference First)
+        max_sims, _ = sims.max(dim=1)
+        channel_order = torch.argsort(max_sims, descending=True).tolist()
+
+        # Iterate channel-by-channel in Strongest-Preference-First order
+        for ch in channel_order:
+            for cl in sorted_centroid_indices_list[ch]:
+                if cluster_counts[cl] < group_size:
+                    channel_to_cluster[ch] = cl
+                    cluster_counts[cl] += 1
+                    break
+
+        # Update centroids to be the normalized mean of each cluster
+        for cl in range(K):
+            ch_indices = (channel_to_cluster == cl).nonzero(as_tuple=True)[0]
+            if len(ch_indices) > 0:
+                cl_channels = normalized_channels[:, ch_indices]
+                mean_channel = cl_channels.mean(dim=1)
+                mean_norm = torch.norm(mean_channel)
+                if mean_norm > 0:
+                    centroids[:, cl] = mean_channel / mean_norm
+                else:
+                    centroids[:, cl] = cl_channels[:, 0]
+
+    # Reconstruct groups
+    groups = [[] for _ in range(K)]
+    for ch, cl in enumerate(channel_to_cluster.tolist()):
+        groups[cl].append(ch)
+
+    return groups
+
+
 def group_channels_random(C: int, group_size: int = 64) -> List[List[int]]:
     """Partition channels randomly as a baseline."""
     perm = torch.randperm(C).tolist()
@@ -103,21 +186,29 @@ def group_channels_random(C: int, group_size: int = 64) -> List[List[int]]:
 def evaluate_grouping(similarity_matrix: torch.Tensor,
                       groups: List[List[int]]) -> Dict[str, float]:
     """Evaluate pairwise similarity statistics across all groups."""
-    group_size = len(groups[0])
+    # Move to CPU for fast, robust evaluation
+    similarity_matrix = similarity_matrix.cpu()
+    groups_tensor = torch.tensor(groups, device=similarity_matrix.device)
+    group_size = groups_tensor.shape[1]
+
+    # Extract unique pairs using upper triangle indices
     triu_indices = torch.triu_indices(group_size, group_size, offset=1)
 
-    all_sims = []
-    for g in groups:
-        sims_g = similarity_matrix[g][:, g]
-        mean_pair_sim = sims_g[triu_indices[0], triu_indices[1]].mean().item()
-        all_sims.append(mean_pair_sim)
+    # Gather rows and columns for parallel indexing
+    rows = groups_tensor[:, triu_indices[0]].flatten()
+    cols = groups_tensor[:, triu_indices[1]].flatten()
 
-    all_sims = np.array(all_sims)
+    flat_sims = similarity_matrix[rows, cols]
+    group_pairwise_sims = flat_sims.reshape(groups_tensor.shape[0], -1)
+
+    # Compute mean pairwise similarity for each of the K groups
+    mean_pair_sims = group_pairwise_sims.mean(dim=1)
+
     return {
-        "mean": float(np.mean(all_sims)),
-        "min": float(np.min(all_sims)),
-        "max": float(np.max(all_sims)),
-        "std": float(np.std(all_sims)),
+        "mean": float(mean_pair_sims.mean().item()),
+        "min": float(mean_pair_sims.min().item()),
+        "max": float(mean_pair_sims.max().item()),
+        "std": float(mean_pair_sims.std().item()),
     }
 
 
@@ -156,9 +247,9 @@ def _parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--method",
-        choices=["greedy", "random", "both"],
-        default="both",
-        help="Grouping method to evaluate (default: both)",
+        choices=["greedy", "random", "kmeans", "all"],
+        default="all",
+        help="Grouping method to evaluate (default: all)",
     )
     p.add_argument(
         "--device",
@@ -234,12 +325,31 @@ def main(argv=None) -> None:
 
         layer_res = {}
 
-        if args.method in ("greedy", "both"):
+        if args.method in ("kmeans", "all"):
+            print("  Grouping channels (balanced k-means method)...", file=sys.stderr)
+            norm_channels = normalize_channels(down_input)
+            kmeans_groups = group_channels_kmeans(norm_channels, group_size=args.group_size)
+            kmeans_stats = evaluate_grouping(sim_matrix, kmeans_groups)
+            layer_res["kmeans"] = kmeans_stats
+            saved_groupings[f"layer{lyr}"] = kmeans_groups
+            print(
+                f"  [K-Means] Intra-group similarity: "
+                f"mean={kmeans_stats['mean']:.5f}, "
+                f"min={kmeans_stats['min']:.5f}, "
+                f"max={kmeans_stats['max']:.5f}, "
+                f"std={kmeans_stats['std']:.5f}",
+                file=sys.stderr,
+            )
+
+        if args.method in ("greedy", "all"):
             print("  Grouping channels (greedy method)...", file=sys.stderr)
             greedy_groups = group_channels_greedy(sim_matrix, group_size=args.group_size)
             greedy_stats = evaluate_grouping(sim_matrix, greedy_groups)
             layer_res["greedy"] = greedy_stats
-            saved_groupings[f"layer{lyr}"] = greedy_groups
+            if args.method == "greedy" or args.method == "all":
+                # Let K-Means take priority if "all" is used, otherwise set it
+                if f"layer{lyr}" not in saved_groupings:
+                    saved_groupings[f"layer{lyr}"] = greedy_groups
             print(
                 f"  [Greedy] Intra-group similarity: "
                 f"mean={greedy_stats['mean']:.5f}, "
@@ -249,7 +359,7 @@ def main(argv=None) -> None:
                 file=sys.stderr,
             )
 
-        if args.method in ("random", "both"):
+        if args.method in ("random", "all"):
             print("  Grouping channels (random method)...", file=sys.stderr)
             random_groups = group_channels_random(C, group_size=args.group_size)
             random_stats = evaluate_grouping(sim_matrix, random_groups)
