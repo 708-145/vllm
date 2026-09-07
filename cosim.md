@@ -50,6 +50,11 @@ To run the script on any `.npz` file and evaluate both the greedy clustering and
   ```bash
   .venv/bin/python cosim.py ffn_activations128.npz --group-size 32
   ```
+* **Binarize with Percentile Threshold (matching O1_predict.py)**:
+  ```bash
+  # Consider top-30% active per token (threshold percentile of 70), binarize to 1/0
+  .venv/bin/python cosim.py ffn_activations128.npz --threshold-pct 70.0
+  ```
 * **Change Output File/Format**:
   ```bash
   # Save as JSON

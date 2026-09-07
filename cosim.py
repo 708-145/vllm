@@ -31,6 +31,16 @@ def load_down_input(
     return down_input
 
 
+def binarise_pct(acts: torch.Tensor, threshold_pct: float) -> torch.Tensor:
+    """Return float mask: 1.0 where |act| exceeds the per-token percentile, else 0.0.
+
+    Matches the thresholding behavior of O1_predict.py.
+    """
+    q = threshold_pct / 100.0
+    thresholds = torch.quantile(torch.abs(acts), q, dim=1, keepdim=True)
+    return (torch.abs(acts) > thresholds).float()
+
+
 def compute_cosine_similarity(activations: torch.Tensor) -> torch.Tensor:
     """Compute the C x C pairwise cosine similarity matrix of the channels."""
     # activations shape: (T, C) where C is intermediate_size
@@ -139,6 +149,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
         help="Specific layers to process (e.g., 0 2). If omitted, processes all layers in the NPZ.",
     )
     p.add_argument(
+        "--threshold-pct",
+        type=float,
+        default=None,
+        help="If set, binarize activations using this percentile threshold (0-100) per token before computing similarity.",
+    )
+    p.add_argument(
         "--method",
         choices=["greedy", "random", "both"],
         default="both",
@@ -208,6 +224,10 @@ def main(argv=None) -> None:
 
         T, C = down_input.shape
         print(f"  Shape: {T} tokens, {C} channels", file=sys.stderr)
+
+        if args.threshold_pct is not None:
+            print(f"  Binarizing activations with threshold-pct={args.threshold_pct}...", file=sys.stderr)
+            down_input = binarise_pct(down_input, args.threshold_pct)
 
         print("  Computing cosine similarity matrix...", file=sys.stderr)
         sim_matrix = compute_cosine_similarity(down_input)
