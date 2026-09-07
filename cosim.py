@@ -1,109 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compute the cosine similarity of the outputs of the gate projection.
+"""Compute the cosine similarity of the down projection input channels.
 
 Groups intermediate FFN channels into highly similar groups of size 64.
 """
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM
 
 
-def get_gate_weight(model: torch.nn.Module, layer_idx: int) -> torch.Tensor:
-    """Retrieve the gate projection weight for the given layer.
-
-    Handles both split (gate_proj) and fused (gate_up_proj) layouts.
-    """
-    # Try common attributes for different model structures
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        layer = model.model.layers[layer_idx]
-    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        layer = model.transformer.h[layer_idx]
-    else:
-        # Generic fallback search
-        for name, module in model.named_modules():
-            if f"layers.{layer_idx}.mlp" in name or f"h.{layer_idx}.mlp" in name:
-                if hasattr(module, "gate_proj"):
-                    return module.gate_proj.weight.data
-                elif hasattr(module, "gate_up_proj"):
-                    weight = module.gate_up_proj.weight.data
-                    intermediate_size = weight.shape[0] // 2
-                    return weight[:intermediate_size]
-        raise RuntimeError(f"Could not find layer {layer_idx} MLP in model")
-
-    if hasattr(layer, "mlp"):
-        mlp = layer.mlp
-    elif hasattr(layer, "ffn"):
-        mlp = layer.ffn
-    elif hasattr(layer, "feed_forward"):
-        mlp = layer.feed_forward
-    else:
-        raise RuntimeError(f"Could not find MLP module in layer {layer_idx}")
-
-    for attr in ("gate_proj", "gate_up_proj", "c_fc", "fc1", "dense_h_to_4h"):
-        proj = getattr(mlp, attr, None)
-        if proj is not None:
-            weight = proj.weight.data
-            if attr == "gate_up_proj":
-                # Fused gate_up_proj, gate is the first half
-                # shape is (2 * intermediate_size, hidden_size)
-                intermediate_size = weight.shape[0] // 2
-                return weight[:intermediate_size]
-            return weight
-
-    raise RuntimeError(
-        f"Could not find gate projection weight in layer {layer_idx} MLP")
-
-
-def load_gate_activations(
+def load_down_input(
     data: Dict[str, np.ndarray],
     layer_idx: int,
-    model: torch.nn.Module | None = None,
     device: str = "cpu",
 ) -> torch.Tensor:
-    """Retrieve or compute the raw gate projection outputs for a layer."""
-    gate_raw_key = f"layer{layer_idx}/gate_raw"
-    if gate_raw_key in data:
-        print(f"  Found pre-computed gate_raw for layer {layer_idx}.")
-        return torch.from_numpy(data[gate_raw_key]).to(device).float()
-
-    input_key = f"layer{layer_idx}/gate_up_input"
-    if input_key not in data:
+    """Retrieve the down projection input activations for a layer."""
+    down_input_key = f"layer{layer_idx}/down_input"
+    if down_input_key not in data:
         raise KeyError(
-            f"Neither '{gate_raw_key}' nor '{input_key}' found in NPZ data.")
+            f"Expected key '{down_input_key}' not found in NPZ data.")
 
-    if model is None:
-        raise ValueError(
-            f"Layer {layer_idx} requires model weights to compute gate_raw from "
-            f"'{input_key}', but no model was provided.")
-
-    print(f"  Computing gate_raw for layer {layer_idx} via model weights...")
-    gate_up_input = torch.from_numpy(data[input_key]).to(device).float()
-    gate_weight = get_gate_weight(model, layer_idx).to(device).float()
-
-    # Project inputs: (num_tokens, hidden_size) @ (intermediate_size, hidden_size).T
-    # -> (num_tokens, intermediate_size)
-    with torch.no_grad():
-        gate_raw = torch.mm(gate_up_input, gate_weight.t())
-
-    return gate_raw
+    print(f"  Loading down_input for layer {layer_idx}...")
+    down_input = torch.from_numpy(data[down_input_key]).to(device).float()
+    return down_input
 
 
-def compute_cosine_similarity(gate_outputs: torch.Tensor) -> torch.Tensor:
+def compute_cosine_similarity(activations: torch.Tensor) -> torch.Tensor:
     """Compute the C x C pairwise cosine similarity matrix of the channels."""
-    # gate_outputs shape: (T, C) where C is intermediate_size
-    norms = torch.norm(gate_outputs, dim=0, keepdim=True)
+    # activations shape: (T, C) where C is intermediate_size
+    norms = torch.norm(activations, dim=0, keepdim=True)
     # Avoid division by zero for inactive/dead channels
     norms = torch.where(norms == 0.0, torch.ones_like(norms), norms)
-    normalized = gate_outputs / norms
+    normalized = activations / norms
     similarity_matrix = torch.mm(normalized.t(), normalized)
     return similarity_matrix
 
@@ -183,14 +117,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
-        "--input",
-        required=True,
+        "input",
         help="Path to the .npz activations file (e.g. ffn_activations128.npz)",
-    )
-    p.add_argument(
-        "--model",
-        default="ibm-granite/granite-4.2-3b",
-        help="HuggingFace model ID/path to load weights from (default: ibm-granite/granite-4.2-3b)",
     )
     p.add_argument(
         "--output",
@@ -267,36 +195,22 @@ def main(argv=None) -> None:
 
     print(f"Processing layers: {target_layers}", file=sys.stderr)
 
-    # Check if we need to load the model
-    needs_model = False
-    for lyr in target_layers:
-        if f"layer{lyr}/gate_raw" not in data:
-            needs_model = True
-            break
-
-    model = None
-    if needs_model:
-        print(f"Loading weights from model '{args.model}' to compute gate_raw...", file=sys.stderr)
-        # Load the model config first, then weights
-        model = AutoModelForCausalLM.from_pretrained(args.model, low_cpu_mem_usage=True)
-        model.eval()
-
     results: Dict[str, Any] = {}
     saved_groupings: Dict[str, Union[List[List[int]], np.ndarray]] = {}
 
     for lyr in target_layers:
         print(f"\n--- Layer {lyr} ---", file=sys.stderr)
         try:
-            gate_raw = load_gate_activations(data, lyr, model=model, device=device)
+            down_input = load_down_input(data, lyr, device=device)
         except Exception as e:
-            print(f"Failed to load/compute gate activations for layer {lyr}: {e}", file=sys.stderr)
+            print(f"Failed to load down_input for layer {lyr}: {e}", file=sys.stderr)
             continue
 
-        T, C = gate_raw.shape
+        T, C = down_input.shape
         print(f"  Shape: {T} tokens, {C} channels", file=sys.stderr)
 
         print("  Computing cosine similarity matrix...", file=sys.stderr)
-        sim_matrix = compute_cosine_similarity(gate_raw)
+        sim_matrix = compute_cosine_similarity(down_input)
 
         layer_res = {}
 
