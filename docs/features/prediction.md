@@ -354,3 +354,139 @@ uses those groups to build the predictor and measure quality.  Better groupings
 summed weight vector is a more faithful representative of the group.  Running
 `cosim.py` with `--method kmeans` instead of `--method greedy` often yields
 tighter groups and a higher `cosim_mean` at the same `grp_active` level.
+
+---
+
+## Down-projection input activation analysis
+
+This section documents empirical analysis of the `down_proj` input vector
+— i.e. `SiLU(gate_raw) * up_proj(x)` — recorded across 128 calibration
+chunks of granite-4.2-3b (12 734 tokens × 8 192 neurons per layer, stored in
+`ffn_activations128.npz`).  The goal is to understand what threshold or
+selection criterion best separates the neurons that matter from those that can
+be skipped.
+
+### Value distribution by layer
+
+`down_input` values are always non-negative (SiLU output multiplied element-
+wise by `up_proj`).  The full-distribution percentiles across all tokens and
+neurons show two distinct regimes:
+
+| Layer range | p20 | p30 | p40 | p50 | p90 | p99 |
+|---|---|---|---|---|---|---|
+| 0 (embedding) | 0.053 | 0.084 | 0.120 | 0.163 | 0.582 | 2.203 |
+| 5–27 (plateau) | 0.019–0.028 | 0.033–0.046 | 0.050–0.069 | 0.069–0.097 | 0.231–0.349 | 0.598–1.063 |
+| 30–35 (late) | 0.026–0.055 | 0.045–0.095 | 0.068–0.142 | 0.097–0.199 | 0.408–0.898 | 1.516–3.938 |
+| 39 (output) | 0.077 | 0.137 | 0.212 | 0.313 | 1.844 | 12.188 |
+
+Key observations:
+
+- **No zero mass.** Every neuron has a positive `down_input` value for every
+  token — SiLU is never exactly zero for finite inputs.  There is no binary
+  sparsity to exploit directly; only magnitude-based selection applies.
+- **Values vary 4× across layers.** Any global absolute threshold would be
+  either too tight for the output layers or too loose for the plateau.
+  Per-token or per-layer normalisation is mandatory.
+- **Heavy tail, consistent shape.** The ratio p50/p99 is 0.05–0.13 across all
+  layers — the top 1% of neurons hold 10–20× the median value.  The bottom
+  20–30% of neurons can be zeroed with negligible contribution.
+- **Per-token p50 cut selects ~50% of neurons by construction.**  The sparse
+  fraction above the per-token median is 42–51% across all layers, confirming
+  that rank-based (top-k%) selection is the natural primitive — not an absolute
+  threshold.
+
+### Energy-based threshold analysis
+
+An alternative to rank-based selection is to keep the minimum number of neurons
+whose cumulative activation energy reaches a target fraction of the total.  Two
+norms were evaluated:
+
+- **L1 energy**: cumulative `|x|` — linear in activation magnitude
+- **L2 energy**: cumulative `|x|²` — squares amplify dominant neurons
+
+The table below shows the median neuron fraction (across tokens) needed to
+capture N% of energy per layer.  Values are medians; token-to-token spread is
+shown separately.
+
+#### L1 energy (`|x|`)
+
+| Layer | ≥80% | ≥90% | ≥95% | ≥99% |
+|---|---|---|---|---|
+| 0 | 0.439 | 0.591 | 0.705 | 0.863 |
+| 5 | 0.409 | 0.556 | 0.670 | 0.838 |
+| 10 | 0.434 | 0.580 | 0.691 | 0.850 |
+| 15 | 0.405 | 0.553 | 0.668 | 0.837 |
+| 20 | 0.400 | 0.548 | 0.664 | 0.834 |
+| 25 | 0.408 | 0.556 | 0.671 | 0.838 |
+| 30 | 0.358 | 0.512 | 0.634 | 0.818 |
+| 35 | 0.338 | 0.498 | 0.625 | 0.815 |
+| 39 | 0.274 | 0.429 | 0.565 | 0.781 |
+
+L1 at 90% energy requires **43–59% of neurons** — barely better than a flat
+50% rank cut.  The linear norm is not strongly concentrated.
+
+#### L2 energy (`|x|²`)
+
+| Layer | ≥80% | ≥90% | ≥95% | ≥99% |
+|---|---|---|---|---|
+| 0 | 0.106 | 0.228 | 0.354 | 0.594 |
+| 5 | 0.130 | 0.242 | 0.353 | 0.569 |
+| 10 | 0.159 | 0.281 | 0.395 | 0.608 |
+| 15 | 0.121 | 0.233 | 0.345 | 0.564 |
+| 20 | 0.118 | 0.228 | 0.338 | 0.557 |
+| 25 | 0.108 | 0.220 | 0.334 | 0.556 |
+| 30 | 0.064 | 0.146 | 0.248 | 0.478 |
+| 35 | 0.038 | 0.093 | 0.179 | 0.418 |
+| 39 | 0.013 | 0.038 | 0.096 | 0.274 |
+
+L2 at 90% energy requires only **4–29% of neurons** — a dramatic reduction
+driven by the squared amplification of dominant activations.  Late layers
+(35–39) are especially sparse in L2: a handful of very large activations
+dominate the squared sum.
+
+#### Token-level spread at 90% energy
+
+The neuron fraction is not fixed — it varies token-by-token.  At the 90%
+energy threshold, the p10–p90 spread across tokens is:
+
+| Layer | L1 p10 | L1 med | L1 p90 | L2 p10 | L2 med | L2 p90 |
+|---|---|---|---|---|---|---|
+| 0 | 0.548 | 0.591 | 0.609 | 0.128 | 0.228 | 0.327 |
+| 10 | 0.569 | 0.580 | 0.589 | 0.226 | 0.281 | 0.314 |
+| 20 | 0.538 | 0.548 | 0.557 | 0.190 | 0.228 | 0.255 |
+| 30 | 0.501 | 0.512 | 0.526 | 0.118 | 0.146 | 0.171 |
+| 39 | 0.369 | 0.429 | 0.461 | 0.015 | 0.038 | 0.082 |
+
+L1 spread is narrow (±3–4 pp), making it predictable.  L2 spread is wide,
+especially in late layers — at layer 39, the p10–p90 range is 0.015–0.082,
+a 5× ratio.  This means a fixed L2 energy budget will significantly over-select
+for most tokens and under-select for a few extreme outlier tokens.
+
+### Comparison of selection strategies
+
+| Strategy | Mid-layer neurons | Layer-39 neurons | Token variability | Notes |
+|---|---|---|---|---|
+| Rank top-50% | 50% | 50% | none | Baseline; blind to magnitude |
+| L1 ≥90% energy | ~55% | ~43% | low (±4 pp) | Small gain over rank; predictable |
+| L2 ≥90% energy | ~22% | ~4% | high (5× range) | Aggressive; dominated by outlier spikes |
+| Gate-score predictor (find_budget.py) | 58–78% | ~48% | n/a | Predictive; budget set before MLP runs |
+
+### Practical guidance
+
+**Use rank-based selection for the gate predictor.**  The `gate_predict.py` /
+`find_budget.py` pipeline already uses top-pct ranking on gate scores, which is
+equivalent to a rank cut on the predicted (pre-SiLU) activation.  This is
+preferable to post-hoc energy cutting because the selection happens *before*
+the MLP runs.
+
+**L2 energy as an oracle lower bound.**  If you have already computed all
+activations and want to know the theoretical minimum compute budget, L2 energy
+at 90% gives a useful floor: ~4–29% of neurons per layer.  This bounds how
+much a perfect predictor could save.  The gap between this floor and the
+gate-score predictor's actual budget (58–78%) represents the remaining
+prediction headroom.
+
+**Avoid global absolute thresholds.**  `down_input` magnitudes vary 4× across
+layers.  Any single threshold (e.g. "zero neurons below 0.05") will be
+miscalibrated outside the plateau layers 5–27.  Always normalise per-token or
+per-layer.
