@@ -3,36 +3,58 @@
 """Gate-threshold sparsity: skip up/down projection for neurons whose
 gate_raw < threshold.
 
-Computes the full gate projection, applies a scalar threshold on the
-pre-SiLU gate logits to decide which neurons are "inactive", and runs
-up_proj + down_proj only on the active neurons.  Compares the sparse
-output to the full-compute reference and reports MSE.
+Two modes:
+
+  threshold mode (default)
+    Sweep one or more explicit gate_raw thresholds.  For each (layer, threshold)
+    pair report: fraction inactive, compute saved, MSE, cosim_mean, cosim_p5.
+
+  target mode (--target-cosim)
+    For each layer binary-search the highest threshold T such that the chosen
+    cosim metric (mean or p5, controlled by --target-metric) stays >= the
+    requested floor.  Reports the derived threshold, inactive fraction, and
+    compute saved alongside the quality metrics.
 
 Per-layer output columns:
-  threshold   -- the gate_raw cutoff used
-  inactive    -- mean fraction of neurons skipped per token
+  threshold     -- gate_raw cutoff used
+  inactive      -- mean fraction of neurons skipped per token
   compute_saved -- MLP compute saving = 2 * inactive_frac / 3
-  MSE         -- mean squared error of sparse vs full down_proj output
+                   (gate always fully computed; only up+down are partial)
+  MSE           -- mean squared error of sparse vs full down_proj output
+  cosim         -- cosine similarity between sparse and full output (scale-free,
+                   layer-comparable; equivalent to quality metric in gate_predict.py)
 
 Usage::
 
-    # Single threshold, all layers
+    # Threshold mode: single value, all layers
     python tools/profiler/gate_threshold.py \\
         --model ibm-granite/granite-4.2-3b \\
         --npz   ffn_activations128_gate.npz \\
         --threshold 0.0
 
-    # Sweep multiple thresholds
+    # Threshold mode: sweep
     python tools/profiler/gate_threshold.py \\
         --model ibm-granite/granite-4.2-3b \\
         --npz   ffn_activations128_gate.npz \\
         --threshold -1.0 -0.5 0.0 0.5 1.0
 
-    # Restrict layers
+    # Target mode: find threshold that keeps cosim_mean >= 0.95
     python tools/profiler/gate_threshold.py \\
         --model ibm-granite/granite-4.2-3b \\
         --npz   ffn_activations128_gate.npz \\
-        --threshold 0.0 \\
+        --target-cosim 0.95
+
+    # Target mode: use cosim_p5 as the quality metric, floor 0.90
+    python tools/profiler/gate_threshold.py \\
+        --model ibm-granite/granite-4.2-3b \\
+        --npz   ffn_activations128_gate.npz \\
+        --target-cosim 0.90 --target-metric p5
+
+    # Target mode: restrict to specific layers
+    python tools/profiler/gate_threshold.py \\
+        --model ibm-granite/granite-4.2-3b \\
+        --npz   ffn_activations128_gate.npz \\
+        --target-cosim 0.95 \\
         --layers 0 15 33 39
 """
 
@@ -108,7 +130,7 @@ def evaluate_threshold(
         threshold: neurons with gate_raw < threshold are skipped.
 
     Returns:
-        Dict with inactive_frac, compute_saved, mse_mean, mse_std.
+        Dict with inactive_frac, compute_saved, mse_mean, mse_std, cosim_mean, cosim_p5.
     """
     gate_w, up_w, down_w = weights["gate"], weights["up"], weights["down"]
     T, H = x.shape
@@ -138,12 +160,81 @@ def evaluate_threshold(
     mse_mean = mse_per_token.mean().item()
     mse_std  = mse_per_token.std().item()
 
+    cs = F.cosine_similarity(sparse_out, full_out, dim=1)  # [T]
+
     return {
         "inactive_frac": inactive_frac,
         "compute_saved": compute_saved,
         "mse_mean":      mse_mean,
         "mse_std":       mse_std,
+        "cosim_mean":    cs.mean().item(),
+        "cosim_p5":      cs.quantile(0.05).item(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Target-cosim mode: binary-search threshold
+# ---------------------------------------------------------------------------
+
+def find_threshold_for_cosim(
+    x: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+    target: float,
+    metric: str = "mean",
+    tol: float = 1e-3,
+    max_iter: int = 40,
+) -> dict[str, float]:
+    """Binary-search the highest gate_raw threshold that keeps cosim >= target.
+
+    Searches over the range [gate_raw.min(), gate_raw.max()].  A higher
+    threshold means more neurons are pruned; the search finds the maximum T
+    where quality is still acceptable.
+
+    Args:
+        x: [T, H] gate_up_input hidden states.
+        weights: dict with keys "gate", "up", "down".
+        target: minimum acceptable cosim value.
+        metric: "mean" or "p5" — which cosim statistic to constrain.
+        tol: convergence tolerance on threshold (default 1e-3).
+        max_iter: maximum bisection iterations (default 40).
+
+    Returns:
+        Same dict as evaluate_threshold, plus "threshold".
+    """
+    gate_w = weights["gate"]
+
+    # Pre-compute gate_raw and full outputs once — reused across all iterations
+    gate_raw = x @ gate_w.T                                          # [T, I]
+    up_out   = x @ weights["up"].T                                   # [T, I]
+    full_out = (F.silu(gate_raw) * up_out) @ weights["down"].T       # [T, H]
+    silu_raw = F.silu(gate_raw)                                      # [T, I]
+
+    lo = gate_raw.min().item()
+    hi = gate_raw.max().item()
+
+    def _cosim_at(thr: float) -> float:
+        active_f = (gate_raw >= thr).float()
+        sparse_out = (silu_raw * active_f * up_out) @ weights["down"].T
+        cs = F.cosine_similarity(sparse_out, full_out, dim=1)
+        return cs.mean().item() if metric == "mean" else cs.quantile(0.05).item()
+
+    # Quick sanity: if even T=lo doesn't meet the floor, return T=lo
+    if _cosim_at(lo) < target:
+        best_thr = lo
+    else:
+        # Bisect: find highest T where cosim >= target
+        best_thr = lo
+        for _ in range(max_iter):
+            mid = (lo + hi) / 2.0
+            if _cosim_at(mid) >= target:
+                best_thr = mid
+                lo = mid
+            else:
+                hi = mid
+            if (hi - lo) < tol:
+                break
+
+    return {**evaluate_threshold(x, weights, best_thr), "threshold": best_thr}
 
 
 # ---------------------------------------------------------------------------
@@ -160,10 +251,21 @@ def _parse_args(argv=None) -> argparse.Namespace:
                    help="HuggingFace model ID or local path.")
     p.add_argument("--npz", required=True,
                    help=".npz file from record_ffn_activations.py.")
-    p.add_argument("--threshold", nargs="+", type=float, default=[0.0],
-                   metavar="T",
-                   help="gate_raw threshold(s). Neurons with gate_raw < T are "
-                        "skipped. Multiple values produce a sweep (default: 0.0).")
+
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--threshold", nargs="+", type=float, default=None,
+                      metavar="T",
+                      help="Threshold mode: gate_raw threshold(s). Neurons with "
+                           "gate_raw < T are skipped. Multiple values produce a "
+                           "sweep. (default when no mode flag given: 0.0)")
+    mode.add_argument("--target-cosim", type=float, default=None,
+                      metavar="C",
+                      help="Target mode: binary-search the highest threshold that "
+                           "keeps cosim >= C per layer.")
+
+    p.add_argument("--target-metric", default="mean", choices=["mean", "p5"],
+                   help="Which cosim statistic to constrain in target mode "
+                        "(default: mean).")
     p.add_argument("--layers", nargs="*", type=int, default=None, metavar="N",
                    help="Layer indices to evaluate. Default: all layers in npz.")
     p.add_argument("--dtype", default="float32",
@@ -183,6 +285,19 @@ def _pick_device(choice: str) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def _print_row(li_label: str, thr: float, r: dict) -> None:
+    thr_s = f"{thr:>+10.4f}" if thr == thr else f"{'nan':>10}"  # nan check
+    print(
+        f"{li_label:>5}  {thr_s}  "
+        f"{r['inactive_frac']*100:>8.1f}%  "
+        f"{r['compute_saved']*100:>8.1f}%  "
+        f"{r['mse_mean']:>12.6f}  "
+        f"{r['mse_std']:>12.6f}  "
+        f"{r['cosim_mean']:>8.5f}  "
+        f"{r['cosim_p5']:>9.5f}"
+    )
 
 
 def main(argv=None) -> None:
@@ -209,17 +324,70 @@ def main(argv=None) -> None:
         print("ERROR: no matching layers found in npz.", file=sys.stderr)
         sys.exit(1)
 
-    thresholds = sorted(args.threshold)
+    hdr = (f"{'layer':>5}  {'threshold':>10}  {'inactive':>9}  {'saved':>9}  "
+           f"{'MSE':>12}  {'MSE_std':>12}  {'cosim':>8}  {'cosim_p5':>9}")
+    sep = "─" * len(hdr)
 
-    hdr  = f"{'layer':>5}  {'threshold':>10}  {'inactive':>9}  {'saved':>9}  {'MSE':>12}  {'MSE_std':>12}"
-    sep  = "─" * len(hdr)
+    # ------------------------------------------------------------------ #
+    # Target mode                                                          #
+    # ------------------------------------------------------------------ #
+    if args.target_cosim is not None:
+        target = args.target_cosim
+        metric = args.target_metric
+        print(f"\ntarget cosim_{metric} >= {target:.4f}")
+        print(hdr)
+        print(sep)
 
-    # Accumulate per-threshold totals for the summary line
-    totals: dict[float, dict[str, list]] = {
-        t: {"inactive": [], "saved": [], "mse": []} for t in thresholds
+        totals: dict[str, list] = {
+            "inactive": [], "saved": [], "mse": [], "cosim": [], "cosim_p5": [],
+        }
+        for li in layers:
+            x = torch.from_numpy(
+                data[f"layer{li}/gate_up_input"].astype(np.float32)
+            ).to(device=device, dtype=dtype)
+            try:
+                w = _load_mlp_weights(model_dir, li, device, dtype)
+            except Exception as e:
+                print(f"{li:>5}  {'WEIGHT LOAD ERROR':>52}  {e}", file=sys.stderr)
+                continue
+
+            r = find_threshold_for_cosim(x, w, target, metric=metric)
+
+            totals["inactive"].append(r["inactive_frac"])
+            totals["saved"].append(r["compute_saved"])
+            totals["mse"].append(r["mse_mean"])
+            totals["cosim"].append(r["cosim_mean"])
+            totals["cosim_p5"].append(r["cosim_p5"])
+
+            _print_row(str(li), r["threshold"], r)
+
+        n = len(totals["inactive"])
+        if n:
+            print(sep)
+            _print_row(
+                "mean",
+                float("nan"),
+                {
+                    "inactive_frac": sum(totals["inactive"]) / n,
+                    "compute_saved": sum(totals["saved"]) / n,
+                    "mse_mean":      sum(totals["mse"]) / n,
+                    "mse_std":       float("nan"),
+                    "cosim_mean":    sum(totals["cosim"]) / n,
+                    "cosim_p5":      sum(totals["cosim_p5"]) / n,
+                },
+            )
+        return
+
+    # ------------------------------------------------------------------ #
+    # Threshold mode                                                       #
+    # ------------------------------------------------------------------ #
+    thresholds = sorted(args.threshold if args.threshold is not None else [0.0])
+
+    thr_totals: dict[float, dict[str, list]] = {
+        t: {"inactive": [], "saved": [], "mse": [], "cosim": [], "cosim_p5": []}
+        for t in thresholds
     }
 
-    prev_thr: float | None = None
     for thr in thresholds:
         print(f"\nthreshold = {thr:+.4f}")
         print(hdr)
@@ -229,7 +397,6 @@ def main(argv=None) -> None:
             x = torch.from_numpy(
                 data[f"layer{li}/gate_up_input"].astype(np.float32)
             ).to(device=device, dtype=dtype)
-
             try:
                 w = _load_mlp_weights(model_dir, li, device, dtype)
             except Exception as e:
@@ -239,27 +406,29 @@ def main(argv=None) -> None:
 
             r = evaluate_threshold(x, w, thr)
 
-            totals[thr]["inactive"].append(r["inactive_frac"])
-            totals[thr]["saved"].append(r["compute_saved"])
-            totals[thr]["mse"].append(r["mse_mean"])
+            thr_totals[thr]["inactive"].append(r["inactive_frac"])
+            thr_totals[thr]["saved"].append(r["compute_saved"])
+            thr_totals[thr]["mse"].append(r["mse_mean"])
+            thr_totals[thr]["cosim"].append(r["cosim_mean"])
+            thr_totals[thr]["cosim_p5"].append(r["cosim_p5"])
 
-            print(
-                f"{li:>5}  {thr:>+10.4f}  "
-                f"{r['inactive_frac']*100:>8.1f}%  "
-                f"{r['compute_saved']*100:>8.1f}%  "
-                f"{r['mse_mean']:>12.6f}  "
-                f"{r['mse_std']:>12.6f}"
-            )
+            _print_row(str(li), thr, r)
 
-        vals = totals[thr]
-        if vals["inactive"]:
-            n = len(vals["inactive"])
+        vals = thr_totals[thr]
+        n = len(vals["inactive"])
+        if n:
             print(sep)
-            print(
-                f"{'mean':>5}  {thr:>+10.4f}  "
-                f"{sum(vals['inactive'])/n*100:>8.1f}%  "
-                f"{sum(vals['saved'])/n*100:>8.1f}%  "
-                f"{sum(vals['mse'])/n:>12.6f}"
+            _print_row(
+                "mean",
+                thr,
+                {
+                    "inactive_frac": sum(vals["inactive"]) / n,
+                    "compute_saved": sum(vals["saved"]) / n,
+                    "mse_mean":      sum(vals["mse"]) / n,
+                    "mse_std":       float("nan"),
+                    "cosim_mean":    sum(vals["cosim"]) / n,
+                    "cosim_p5":      sum(vals["cosim_p5"]) / n,
+                },
             )
 
 

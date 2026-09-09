@@ -671,12 +671,19 @@ neurons depending on the layer.
 
 `tools/profiler/gate_threshold.py` computes the full gate projection, applies
 a `gate_raw` threshold to predict inactive neurons, and runs `up_proj` +
-`down_proj` only on the active set.  For each layer it reports:
+`down_proj` only on the active set.  The tool has two modes:
 
-- **inactive_frac** — fraction of neurons predicted unused (gate_raw < threshold)
-- **compute_saved** — total MLP compute saved = `2 × inactive_frac / 3`
-- **MSE** — mean squared error of the sparse vs full `down_proj` output vector,
-  averaged over tokens
+- **threshold mode** — sweep one or more explicit `gate_raw` cutoff values
+- **target mode** — binary-search the per-layer threshold that meets a cosim floor
+
+Per-layer output columns:
+
+- **threshold** — `gate_raw` cutoff used (derived by search in target mode)
+- **inactive** — mean fraction of neurons skipped per token
+- **saved** — MLP compute saving = `2 × inactive / 3`
+  (gate always fully computed; only up+down are partial; ceiling is 66.7%)
+- **MSE / MSE_std** — mean squared error vs full output (scale-dependent; use cosim for cross-layer comparison)
+- **cosim / cosim_p5** — mean and 5th-percentile cosine similarity vs full output
 
 ```
 x ──▶ gate_proj (full) ──▶ gate_raw ──▶ gate_raw ≥ T ? active
@@ -684,10 +691,13 @@ x ──▶ gate_proj (full) ──▶ gate_raw ──▶ gate_raw ≥ T ? activ
 x ──▶ up_proj (active only) ──────────────────────────▶ × ──▶ down_proj (active only) ──▶ out
 ```
 
-### Usage
+### Threshold mode
+
+Evaluate one or more fixed thresholds across all (or selected) layers.
+Neurons with `gate_raw < T` are zeroed before `up_proj`/`down_proj`.
 
 ```bash
-# Single threshold sweep on all layers
+# Single threshold, all layers
 .venv/bin/python tools/profiler/gate_threshold.py \
     --model ibm-granite/granite-4.2-3b \
     --npz  ffn_activations128_gate.npz \
@@ -698,14 +708,91 @@ x ──▶ up_proj (active only) ───────────────�
     --model ibm-granite/granite-4.2-3b \
     --npz  ffn_activations128_gate.npz \
     --threshold -1.0 -0.5 0.0 0.5 1.0
+```
+
+Example output at `T = 0.0` (representative layers):
+
+```
+threshold = +0.0000
+layer   threshold   inactive      saved           MSE       MSE_std     cosim   cosim_p5
+────────────────────────────────────────────────────────────────────────────────────────
+    0     +0.0000      81.1%      54.1%      0.022770      0.010653   0.70049    0.46799
+    2     +0.0000      58.2%      38.8%      0.004225      0.001786   0.82579    0.75322
+   10     +0.0000      83.8%      55.8%      0.002269      0.000650   0.62867    0.46800
+   15     +0.0000      73.0%      48.7%      0.001786      0.000577   0.77558    0.68413
+   33     +0.0000      53.1%      35.4%      0.003672      0.000685   0.95257    0.93087
+   39     +0.0000      66.5%      44.3%      0.103709      0.028500   0.94352    0.87517
+────────────────────────────────────────────────────────────────────────────────────────
+ mean     +0.0000      69.3%      46.2%      0.023072           nan   0.80444    0.69656
+```
+
+Note: MSE is high for layer 39 due to large absolute activations (p99 ≈ 12.19);
+cosim_mean of 0.94 shows the relative quality is actually better than layer 10.
+`T = 0` is too aggressive for the middle layers (cosim_p5 of 0.47–0.68).
+
+### Target mode
+
+Binary-searches the **highest `gate_raw` threshold** per layer such that a
+chosen cosim metric stays at or above a specified floor.  All gate and
+up/down projections are pre-computed once per layer; only the masking is
+swept during the search, so it is fast (≈40 bisection steps per layer).
+
+```bash
+# Find threshold per layer keeping cosim_mean >= 0.95
+.venv/bin/python tools/profiler/gate_threshold.py \
+    --model ibm-granite/granite-4.2-3b \
+    --npz  ffn_activations128_gate.npz \
+    --target-cosim 0.95
+
+# Use cosim_p5 as the quality metric (stricter: worst-case token guarantee)
+.venv/bin/python tools/profiler/gate_threshold.py \
+    --model ibm-granite/granite-4.2-3b \
+    --npz  ffn_activations128_gate.npz \
+    --target-cosim 0.95 --target-metric p5
 
 # Restrict to specific layers
 .venv/bin/python tools/profiler/gate_threshold.py \
     --model ibm-granite/granite-4.2-3b \
     --npz  ffn_activations128_gate.npz \
-    --threshold 0.0 \
-    --layers 0 15 33 39
+    --target-cosim 0.95 --layers 0 15 33 39
 ```
+
+Example output — `cosim_mean ≥ 0.95`:
+
+```
+target cosim_mean >= 0.9500
+layer   threshold   inactive      saved           MSE       MSE_std     cosim   cosim_p5
+────────────────────────────────────────────────────────────────────────────────────────
+    0     -1.6870      30.5%      20.4%      0.003831      0.001394   0.95006    0.87520
+    2     -0.9777      22.0%      14.7%      0.001447      0.000768   0.95005    0.92859
+   10     -1.5305      16.9%      11.3%      0.000410      0.000251   0.95003    0.92519
+   15     -1.2821      14.5%       9.7%      0.000468      0.000249   0.95006    0.92532
+   33     +0.4563      68.4%      45.6%      0.003866      0.000684   0.95000    0.92795
+   39     -0.7087      48.2%      32.1%      0.092740      0.025394   0.95001    0.88844
+────────────────────────────────────────────────────────────────────────────────────────
+ mean         nan      33.4%      22.3%      0.017127           nan   0.95004    0.91178
+```
+
+Example output — `cosim_p5 ≥ 0.95` (worst-case token guarantee):
+
+```
+target cosim_p5 >= 0.9500
+layer   threshold   inactive      saved           MSE       MSE_std     cosim   cosim_p5
+────────────────────────────────────────────────────────────────────────────────────────
+    0     -2.0872      15.2%      10.1%      0.001290      0.000435   0.98138    0.95001
+    2     -1.1658      17.5%      11.7%      0.001013      0.000548   0.96528    0.95003
+   10     -1.7035      12.4%       8.2%      0.000271      0.000191   0.96803    0.95005
+   15     -1.4459      10.1%       6.7%      0.000308      0.000185   0.96814    0.95003
+   33     -0.8505      23.9%      15.9%      0.002663      0.000548   0.96591    0.95003
+   39     -1.7415      26.7%      17.8%      0.042290      0.012009   0.97882    0.95000
+────────────────────────────────────────────────────────────────────────────────────────
+ mean         nan      17.6%      11.8%      0.007972           nan   0.97126    0.95002
+```
+
+Constraining `cosim_mean` yields 22% mean saving; tightening to `cosim_p5`
+(every token guaranteed ≥ 0.95) reduces saving to 12% — the worst-case token
+is harder to protect.  Thresholds vary substantially across layers (−2.09 to
++0.46) reflecting the different gate_raw scale per layer.
 
 ### Options
 
@@ -713,32 +800,9 @@ x ──▶ up_proj (active only) ───────────────�
 | --- | --- | --- |
 | `--model` | *(required)* | HuggingFace model ID or local path |
 | `--npz` | *(required)* | `.npz` file from `record_ffn_activations.py` |
-| `--threshold T …` | `0.0` | `gate_raw` threshold(s); neurons with `gate_raw < T` are skipped |
+| `--threshold T …` | `0.0` | Threshold mode: `gate_raw` cutoff(s); mutually exclusive with `--target-cosim` |
+| `--target-cosim C` | — | Target mode: binary-search threshold to keep cosim ≥ C per layer |
+| `--target-metric` | `mean` | Quality metric for target mode: `mean` or `p5` |
 | `--layers N …` | all | Layer indices to evaluate |
 | `--dtype` | `float32` | Compute dtype (`float32` or `bfloat16`) |
-
-### Output
-
-```
-threshold = +0.0000
-layer   threshold   inactive      saved           MSE       MSE_std
-───────────────────────────────────────────────────────────────────
-    0     +0.0000      81.1%      54.1%      0.022770      0.010653
-    1     +0.0000      84.2%      56.2%      0.012255      0.004852
-    2     +0.0000      58.2%      38.8%      0.004225      0.001786
-    5     +0.0000      67.0%      44.7%      0.001786      0.000784
-   10     +0.0000      83.8%      55.8%      0.002269      0.000650
-   15     +0.0000      73.0%      48.7%      0.001786      0.000577
-   20     +0.0000      71.7%      47.8%      0.001736      0.000375
-   25     +0.0000      74.4%      49.6%      0.001974      0.000540
-   30     +0.0000      62.0%      41.4%      0.001878      0.000390
-   33     +0.0000      53.1%      35.4%      0.003672      0.000685
-   35     +0.0000      65.7%      43.8%      0.012452      0.003673
-   39     +0.0000      66.5%      44.3%      0.103709      0.028500
-───────────────────────────────────────────────────────────────────
- mean     +0.0000      70.1%      46.7%      0.014209
-```
-
-MSE is high for layer 39 because that layer has very large activations
-(p99 ≈ 12.19 in absolute magnitude); the relative error (cosine similarity)
-is still 0.97+ as shown in the gate-first oracle section above.
+| `--device` | `auto` | Torch device: `auto`, `cpu`, `cuda`, `mps` |
