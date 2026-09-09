@@ -490,3 +490,255 @@ prediction headroom.
 layers.  Any single threshold (e.g. "zero neurons below 0.05") will be
 miscalibrated outside the plateau layers 5–27.  Always normalise per-token or
 per-layer.
+
+---
+
+## Gate-first oracle: full gate + sparse up/down
+
+A fundamentally different strategy to the weight-based group predictor is to
+**compute the full gate projection first**, use the resulting SiLU activations
+as a perfect per-token oracle to select the top-K neurons, and then run only
+those K neurons through `up_proj` and `down_proj`.
+
+```
+x ──▶ gate_proj (full, H×I) ──▶ SiLU(·) ──▶ top-K selection
+                                                    │
+x ──▶ up_proj (K columns only) ──────────────────▶ × ──▶ down_proj (K rows only) ──▶ out
+```
+
+This is an **oracle** — it cannot be directly applied at inference time because
+the gate values are only known after running gate_proj, which is precisely the
+computation that precedes up/down.  Its value is as a **quality ceiling**: it
+tells us exactly how much up/down compute can be saved given a perfect gate
+signal, and it establishes an upper bound on what any predictive scheme can
+achieve.
+
+### Compute accounting
+
+Each of `gate_proj`, `up_proj`, `down_proj` costs `H×I` multiplications
+(`H=2560`, `I=8192` for granite-4.2-3b → 20.97 M mults/token each, 62.9 M
+total).  Under the gate-first scheme:
+
+```
+total cost = gate(H×I) + up(H×K) + down(H×K) = H×I × (1 + 2×K/I)
+```
+
+Compute saving vs full MLP = `2×(1 − K/I) / 3`.  The floor is **33.3% saving
+at K=0** (gate cost can never be avoided), and saving scales linearly with the
+fraction of neurons skipped.
+
+| K/I | neurons computed | total cost (vs full) | saving |
+|---|---|---|---|
+| 1.00 | 8192 | 100% | 0% |
+| 0.90 | 7373 | 93.3% | **6.7%** |
+| 0.80 | 6554 | 86.7% | **13.3%** |
+| 0.70 | 5734 | 80.0% | **20.0%** |
+| 0.50 | 4096 | 66.7% | **33.3%** |
+| 0.20 | 1638 | 46.7% | **53.3%** |
+
+### Quality curve (granite-4.2-3b, all 40 layers)
+
+Neurons are selected by descending `SiLU(gate_raw)` per token; quality is
+measured as cosine similarity between the sparse and full `down_proj` output.
+
+The minimum K/I needed to reach each cosim_p5 floor, across all 40 layers:
+
+| Layer | K/I for p5≥0.99 | saving | K/I for p5≥0.98 | saving | K/I for p5≥0.97 | saving |
+|---|---|---|---|---|---|---|
+| 0 | 0.97 | 2.0% | 0.93 | 4.7% | 0.90 | 6.7% |
+| 1–2 | 0.97 | 2.0% | 0.94 | 4.0% | 0.91–0.92 | 5–6% |
+| 3–7 | 0.98 | 1.3% | 0.95–0.96 | 2.7–3.3% | 0.93–0.94 | 4–5% |
+| 8–14 | 0.98–0.99 | 0.7–1.3% | 0.96–0.97 | 2–2.7% | 0.94–0.95 | 3.3–4% |
+| 15–27 | 0.98–0.99 | 0.7–1.3% | 0.96–0.97 | 2–2.7% | 0.93–0.95 | 3.3–4.7% |
+| 28–31 | 0.97–0.98 | 1.3–2.0% | 0.93–0.95 | 3.3–4.7% | 0.90–0.92 | 5.3–6.7% |
+| 32–39 | 0.90–0.96 | 2.7–6.7% | 0.85–0.91 | 6–10% | 0.85 | **10%** |
+
+**Summary across all 40 layers:**
+
+| Quality floor | Feasible layers | Mean saving |
+|---|---|---|
+| cosim_p5 ≥ 0.99 | 40/40 | **1.9%** |
+| cosim_p5 ≥ 0.98 | 40/40 | **3.7%** |
+| cosim_p5 ≥ 0.97 | 40/40 | **5.4%** |
+
+### Key findings
+
+**1 — The gate signal is a near-perfect oracle, but the saving is modest.**
+Even skipping only the bottom 1–7% of neurons (by SiLU value) is enough to
+hold cosim_p5 ≥ 0.99 on every layer.  The bottom 15% can be skipped at
+cosim_p5 ≥ 0.97.  However, the ceiling saving of the entire approach is only
+5–10% because the gate projection (1/3 of MLP compute) must always be run.
+
+**2 — Late layers (32–39) are far more skippable than early/middle layers.**
+At p5≥0.97, layers 32–39 need only K/I=0.85 (10% saving); layers 3–27 only
+allow 3–5% saving at the same floor.  This mirrors the L2 energy analysis —
+late layers have highly concentrated activation distributions dominated by a
+few large neurons.
+
+**3 — This scheme is complementary to, not a replacement for, the group predictor.**
+The gate-first oracle provides a hard ceiling.  The group predictor
+([`gate_predict.py`](../../tools/profiler/gate_predict.py) /
+[`find_budget.py`](../../tools/profiler/find_budget.py)) operates *before* any
+MLP compute by predicting which neuron groups to skip, avoiding up to 58–78%
+of total MLP cost (including the gate projection) at equivalent quality floors.
+The trade-off is prediction error: the oracle is lossless within its K budget;
+the predictor incurs false positives and false negatives.
+
+**4 — Practical hybrid.**
+A viable production strategy is to combine both:
+- Run gate_proj fully (unavoidable for decoding-step latency).
+- Use the true SiLU values to skip the bottom `B%` of up_proj/down_proj neurons.
+- Skipping 10–15% of up/down at cosim_p5 ≥ 0.97 costs only 3–5% total MLP
+  saving but requires zero prediction infrastructure — just a `topk` on the
+  gate output that is already computed.
+
+This is particularly attractive when `gate_proj` and `up_proj` are fused in
+hardware (as in the `gate_up_proj` merged weight used by vLLM), where the gate
+values are already in registers before the element-wise SiLU multiply.
+
+---
+
+## SiLU(gate) distribution and the near-zero region
+
+`SiLU(x) = x · σ(x)` reaches its global minimum at `x ≈ −1.28`, giving
+`SiLU(−1.28) ≈ −0.2785`.  For large negative gate logits the output saturates
+at this floor rather than going to zero.  Measured across all 40 layers of
+granite-4.2-3b (12 734 tokens × 8 192 neurons per layer):
+
+### Percentile structure
+
+Every layer's p1 and p5 sit at or within 0.002 of the −0.2785 floor, meaning
+the bottom ~5 % of neurons are saturated at the minimum on every layer.  The
+median (p50) is **negative on all 40 layers**, ranging from −0.24 (layers 0–1,
+heavily saturated) down to −0.04 (layer 33, least saturated).  Only the p75
+crosses zero for many layers; the top 10–25 % of neurons carry positive signal.
+
+| Layer range | p50 | p75 | p90 | character |
+|---|---|---|---|---|
+| 0–1 | −0.24 | −0.14 | +0.19 to +0.83 | deeply saturated |
+| 2–5 | −0.08 to −0.19 | +0.09 to +0.23 | +0.40 to +0.72 | widest spread |
+| 6–14 | −0.19 to −0.24 | −0.09 to −0.05 | +0.10 to +0.26 | mid plateau |
+| 15–28 | −0.14 to −0.23 | 0.00 to +0.12 | +0.31 to +0.52 | plateau / rising |
+| 29–39 | −0.04 to −0.18 | +0.18 to +0.46 | +0.64 to +1.35 | late layers, heavy tail |
+
+### Near-zero fraction by layer
+
+The fraction of neurons with `SiLU(gate) < 0` (negative, near-floor) and
+`< 0.01` (effectively zero contribution) are nearly identical — confirming the
+negative region is tightly clustered at −0.278 rather than spread across a
+wide negative range.
+
+| Layer | neg < 0 | < 0.01 | < 0.1 |
+|---|---|---|---|
+| 0 | 81% | 81% | 83% |
+| 1 | 84% | 85% | 88% |
+| 2 | 58% | 59% | 67% | ← least saturated early layer
+| 8–13 | 79–86% | 80–86% | 86–90% | ← most saturated plateau
+| 16 | 67% | 67% | 74% |
+| 33 | **53%** | **54%** | **60%** | ← global minimum (late)
+| 39 | 67% | 67% | 71% |
+
+The mean across all layers is **~71% of neurons per token** with negative SiLU
+output (near-floor), and **~73% below 0.01**.  Only the top ~27–30% of neurons
+carry a meaningfully positive gate activation on any given token.
+
+### Why the negative floor matters for thresholding
+
+A threshold on `gate_raw` (pre-SiLU) is cleaner than one on `SiLU(gate_raw)`
+because:
+
+1. `gate_raw` has a true zero crossing at `x = 0`; neurons with `gate_raw < 0`
+   produce small-magnitude (but non-zero) SiLU outputs near the −0.2785 floor.
+2. Gating on `gate_raw < threshold` can use a single scalar comparison per
+   neuron with no activation function evaluation for the pruned set.
+3. The `gate_threshold.py` tool (below) implements exactly this: it computes
+   the full gate projection, applies a user-supplied `gate_raw` threshold, and
+   runs `up_proj` + `down_proj` only on the surviving neurons.
+
+### Relationship to the gate-first oracle
+
+The top-K oracle (previous section) selects by descending `SiLU` value;
+threshold gating selects by `gate_raw > T`.  They are equivalent when T maps
+to the K-th largest `gate_raw` value, but threshold gating is simpler to
+implement and has a natural semantic: neurons with `gate_raw < 0` are on the
+saturated-negative portion of SiLU and contribute negatively to the output.
+Setting `T = 0` prunes all such neurons, which is approximately 60–85% of
+neurons depending on the layer.
+
+---
+
+## Gate-threshold tool (`gate_threshold.py`)
+
+`tools/profiler/gate_threshold.py` computes the full gate projection, applies
+a `gate_raw` threshold to predict inactive neurons, and runs `up_proj` +
+`down_proj` only on the active set.  For each layer it reports:
+
+- **inactive_frac** — fraction of neurons predicted unused (gate_raw < threshold)
+- **compute_saved** — total MLP compute saved = `2 × inactive_frac / 3`
+- **MSE** — mean squared error of the sparse vs full `down_proj` output vector,
+  averaged over tokens
+
+```
+x ──▶ gate_proj (full) ──▶ gate_raw ──▶ gate_raw ≥ T ? active
+                                                          │
+x ──▶ up_proj (active only) ──────────────────────────▶ × ──▶ down_proj (active only) ──▶ out
+```
+
+### Usage
+
+```bash
+# Single threshold sweep on all layers
+.venv/bin/python tools/profiler/gate_threshold.py \
+    --model ibm-granite/granite-4.2-3b \
+    --npz  ffn_activations128_gate.npz \
+    --threshold 0.0
+
+# Sweep multiple thresholds
+.venv/bin/python tools/profiler/gate_threshold.py \
+    --model ibm-granite/granite-4.2-3b \
+    --npz  ffn_activations128_gate.npz \
+    --threshold -1.0 -0.5 0.0 0.5 1.0
+
+# Restrict to specific layers
+.venv/bin/python tools/profiler/gate_threshold.py \
+    --model ibm-granite/granite-4.2-3b \
+    --npz  ffn_activations128_gate.npz \
+    --threshold 0.0 \
+    --layers 0 15 33 39
+```
+
+### Options
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--model` | *(required)* | HuggingFace model ID or local path |
+| `--npz` | *(required)* | `.npz` file from `record_ffn_activations.py` |
+| `--threshold T …` | `0.0` | `gate_raw` threshold(s); neurons with `gate_raw < T` are skipped |
+| `--layers N …` | all | Layer indices to evaluate |
+| `--dtype` | `float32` | Compute dtype (`float32` or `bfloat16`) |
+
+### Output
+
+```
+threshold = +0.0000
+layer   threshold   inactive      saved           MSE       MSE_std
+───────────────────────────────────────────────────────────────────
+    0     +0.0000      81.1%      54.1%      0.022770      0.010653
+    1     +0.0000      84.2%      56.2%      0.012255      0.004852
+    2     +0.0000      58.2%      38.8%      0.004225      0.001786
+    5     +0.0000      67.0%      44.7%      0.001786      0.000784
+   10     +0.0000      83.8%      55.8%      0.002269      0.000650
+   15     +0.0000      73.0%      48.7%      0.001786      0.000577
+   20     +0.0000      71.7%      47.8%      0.001736      0.000375
+   25     +0.0000      74.4%      49.6%      0.001974      0.000540
+   30     +0.0000      62.0%      41.4%      0.001878      0.000390
+   33     +0.0000      53.1%      35.4%      0.003672      0.000685
+   35     +0.0000      65.7%      43.8%      0.012452      0.003673
+   39     +0.0000      66.5%      44.3%      0.103709      0.028500
+───────────────────────────────────────────────────────────────────
+ mean     +0.0000      70.1%      46.7%      0.014209
+```
+
+MSE is high for layer 39 because that layer has very large activations
+(p99 ≈ 12.19 in absolute magnitude); the relative error (cosine similarity)
+is still 0.97+ as shown in the gate-first oracle section above.
