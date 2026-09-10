@@ -200,7 +200,97 @@ See Section 8 below.
 
 ---
 
-## 8. `gate_proj` and `up_proj` — TODO
+## 8. `gate_proj` and `up_proj`
 
-Applicability of the above LUT compression to `gate_proj` [8192, 2560] and
-`up_proj` [8192, 2560] is evaluated in the next section.
+Shape: `[8192, 2560]` — 8192 rows (neurons), each reading from 2560 residual-stream
+dims. The per-row orientation is the same as `down_proj` (rows = the unit being
+quantized), but H=2560 instead of 8192, which raises LUT overhead slightly.
+
+### 8a. Weight distribution
+
+| Projection | std (mean) | kurtosis | row_norm_cv | col_norm_cv |
+|---|---|---|---|---|
+| `gate_proj` | 0.01230 | 4.42 | 0.141 | 0.036 |
+| `up_proj` | 0.01371 | 3.88 | 0.116 | 0.050 |
+| `down_proj` | 0.00309 | 4.23 | 0.090 | 0.099 |
+
+Both are near-Gaussian (kurtosis 3.9–4.9 vs Gaussian=3). Higher kurtosis than
+`down_proj` means slightly heavier tails — more outlier rows will need larger N.
+Row-norm CV is higher (0.12–0.15 vs 0.07–0.09), confirming per-row scale remains
+the right granularity.
+
+### 8b. LUT overhead at H=2560
+
+With H=2560 (vs H=8192 for `down_proj`), the LUT storage cost per weight is
+**3.2× higher**: `n×16 / 2560` vs `n×16 / 8192`. At N=6: 0.044 b/w overhead
+(vs 0.012 for `down_proj`). Still small relative to the index bits.
+
+### 8c. Fixed-N results (gate + up both quantized, down_proj exact)
+
+Quality measured at **FFN output** — errors from gate and up propagate
+multiplicatively through the SiLU gating.
+
+| N | idx b/w | lut oh | total b/w | out cosim (mean) | out cosim p5 |
+|---|---|---|---|---|---|
+| 6 | 2.600 | 0.044 | **2.644** | 0.941–0.962 | 0.872–0.946 |
+| 7 | 2.818 | 0.050 | **2.868** | 0.953–0.976 | 0.880–0.959 |
+| 8 | 3.000 | 0.056 | **3.056** | 0.961–0.981 | 0.895–0.968 |
+| 10 | 3.333 | 0.069 | **3.402** | 0.975–0.989 | 0.946–0.979 |
+
+(Ranges across layers 0, 8, 17, 31, 39.)
+
+### 8d. Adaptive per-row N (gate and up must both satisfy floor)
+
+| Floor | Dom N | idx b/w | total b/w | out cosim | out p5 |
+|---|---|---|---|---|---|
+| 0.980 | 8 | 3.01–3.06 | **3.07–3.11** | 0.975–0.985 | 0.954–0.969 |
+| 0.970 | 7 | 2.72–2.79 | **2.76–2.84** | 0.963–0.977 | 0.943–0.958 |
+| **0.960** | **6** | **2.60–2.62** | **2.65–2.67** | **0.947–0.972** | **0.902–0.945** |
+| 0.950 | 6 | 2.60–2.61 | 2.65–2.65 | 0.942–0.958 | 0.871–0.946 |
+
+Distribution at floor 0.960: ~93–99% of rows use N=6, ~2–5% need N=7 or 8.
+
+### 8e. Comparison to `down_proj`
+
+| Projection | Floor 0.960 total b/w | out cosim range |
+|---|---|---|
+| `down_proj` | **2.62** | 0.966–0.982 |
+| `gate_proj`+`up_proj` | **2.65–2.67** | 0.947–0.972 |
+
+Gate/up cosim is slightly lower because errors in gate and up **multiply**
+(SiLU gate × up activation) — the two quantization errors compound rather
+than add. Higher kurtosis also means more outlier rows requiring N>6.
+
+### 8f. Combined model compression (all three projections)
+
+At the N=6 / floor 0.960 operating point across all three projections:
+
+| Projection | b/w | notes |
+|---|---|---|
+| `gate_proj` LUT | ~2.66 | N=6 dominant, per-row scale |
+| `up_proj` LUT | ~2.66 | same |
+| `down_proj` LUT | ~2.62 | N=6 dominant, per-row scale |
+| **MLP average** | **~2.65** | vs int4 = 4.00 b/w |
+| **Saving vs int4** | **−1.35 b/w (−34%)** | at cosim ≥ 0.95–0.97 |
+
+The LUT approach is equally applicable to all three MLP projections.
+The same N=6 operating point and 5-into-13-bit packing applies throughout.
+
+### 8g. Side-by-side structural comparison
+
+| Property | `down_proj` [2560, 8192] | `gate_proj`/`up_proj` [8192, 2560] |
+|---|---|---|
+| Distribution | near-Gaussian, kurt 4.2 | near-Gaussian, kurt 3.9–4.4 |
+| Per-row scale meaning | one scale per residual-stream output dim | one scale per neuron |
+| H per row | 8192 | 2560 |
+| LUT overhead at N=6 | 0.012 b/w | 0.044 b/w (3.2× more, still small) |
+| Floor 0.960 total b/w | **2.62** | **2.65–2.67** |
+| Floor 0.960 cosim range | 0.966–0.982 | 0.947–0.972 |
+| Dominant N at floor 0.960 | 6 | 6 |
+| Error propagation | additive to residual stream | multiplicative (gate × up) |
+
+The smaller H=2560 raises the per-weight LUT overhead but it remains under
+0.05 b/w. The main quality gap comes from the multiplicative error: quantizing
+both gate and up independently means their errors multiply through
+`silu(gate) × up` before entering `down_proj`, whereas `down_proj` quantization
+error is purely additive to the residual stream.
