@@ -191,7 +191,7 @@ or 10 indices into 26 bits. LUT decode is a single table lookup.
 |---|---|---|---|
 | cosim ≥ 0.99 | int4 uniform, per-col scale | 4.00 | Baseline |
 | cosim ≥ 0.99 | N=10 Lloyd-Max, per-row scale | 3.11 | Shared 10-entry LUT |
-| **cosim ≥ 0.97** | **Per-row N=6..8, per-row scale** | **2.62** | 5-into-13-bit packing |
+| **cosim ≥ 0.97** | **Per-row 6-6-7, per-row scale** | **2.667** | 1 byte per 3 values |
 | cosim ≥ 0.95 | Per-row N=5..7, per-row scale | 2.36 | 3-into-7-bit packing |
 
 ### `gate_proj` / `up_proj`
@@ -294,3 +294,116 @@ The smaller H=2560 raises the per-weight LUT overhead but it remains under
 both gate and up independently means their errors multiply through
 `silu(gate) × up` before entering `down_proj`, whereas `down_proj` quantization
 error is purely additive to the residual stream.
+
+---
+
+## 9. Per-row 6-6-7 encoding
+
+### 9a. Byte-packing insight
+
+Both pure 6-6-6 and mixed 6-6-7 pack exactly into **one byte per 3 values**:
+
+| Scheme | codewords needed | fits in 1 byte? | bpw |
+|---|---|---|---|
+| 6-6-6 (pure N=6) | 6³ = 216 | ✅ ≤ 256 | **2.667** |
+| **6-6-7** | 6×6×7 = 252 | ✅ ≤ 256 | **2.667** |
+| 7-7-7 (pure N=7) | 7³ = 343 | ❌ > 256 | needs 9 bits |
+
+The 6-6-7 scheme costs **nothing extra** vs pure 6-6-6. It simply uses 36 of
+the 40 spare codewords (256−216) to give every third position one additional
+reconstruction level — strictly better quality at identical storage cost.
+
+Per row: two LUTs are fitted to the row's actual weight distribution — a 6-level
+LUT6 and a 7-level LUT7 (both Lloyd-Max on that row's values). Positions 0,1
+of each triplet use LUT6; position 2 uses LUT7.
+
+An adaptive fallback chooses N=12 for rows where 6-6-7 weight cosim falls below
+a threshold.
+
+### 9b. Metadata layout — no separate scale needed
+
+LUT values are stored as fp16 directly in the weight's original scale, so a
+separate per-row scale factor is **redundant** — the LUT entries are the
+reconstruction values already in the right units.
+
+Per-row metadata is a fixed **13 × fp16 = 208 bits** block for both formats:
+
+```
+6-6-7 row:  [fp16 × 6: LUT6 levels] [fp16 × 7: LUT7 levels]   = 208 bits
+N=12 row:   [fp16 × 12: LUT levels] [fp16: sentinel = NaN]     = 208 bits
+```
+
+The 13th fp16 is the format flag: if it is NaN → N=12 mode (entries 1–12 are
+the levels); otherwise it is the 7th LUT7 entry → 6-6-7 mode. No separate
+flag table, no side-channel, uniform metadata stride of 208 bits per row.
+
+Note: N=12 fallback rows use only 12 entries and get the NaN sentinel "for
+free" — their metadata is actually 16 bits smaller in information content than
+a 6-6-7 row.
+
+### 9c. Corrected bpw accounting
+
+Removing the redundant scale field:
+
+| Component | old (with scale) | new (no scale) |
+|---|---|---|
+| Index bytes | 8/3 b/w | 8/3 b/w |
+| LUT metadata at H=8192 | (6+7+1)×16/8192 | (6+7)×16/8192 |
+| LUT metadata at H=2560 | (6+7+1)×16/2560 | (6+7)×16/2560 |
+| **Total bpw (H=8192)** | **2.694** | **2.669** |
+| **Total bpw (H=2560)** | **2.754** | **2.719** |
+
+### 9d. Quality gain over pure 6-6-6 (per-row LUT6)
+
+Evaluated on 10 representative layers (0,4,8,12,17,22,27,31,35,39).
+"floor" = per-row weight cosim threshold below which the row falls back to N=12.
+
+**`down_proj` (H=8192):**
+
+| floor | % rows use 6-6-7 | out cosim | Δ vs pure LUT6 | Δ vs pure N=12 |
+|---|---|---|---|---|
+| 0.990 | 0% | 0.982–0.995 | +0.011–+0.030 | ±0.000 (= N=12) |
+| 0.980 | 0% | 0.982–0.995 | +0.011–+0.030 | ±0.000 (= N=12) |
+| **0.970** | **41–99%** | **0.965–0.991** | **+0.001–+0.019** | **−0.004–−0.016** |
+| 0.960 | 92–99% | 0.965–0.985 | +0.000–+0.013 | −0.010–−0.018 |
+
+**`gate_proj` + `up_proj` (H=2560):**
+
+| floor | % rows use 6-6-7 | out cosim | Δ vs pure LUT6 | Δ vs pure N=12 |
+|---|---|---|---|---|
+| 0.990 | 0% | 0.975–0.991 | +0.016–+0.039 | ±0.000 (= N=12) |
+| 0.980 | 0% | 0.975–0.991 | +0.016–+0.039 | ±0.000 (= N=12) |
+| **0.970** | **78–96%** | **0.955–0.979** | **+0.003–+0.036** | **−0.006–−0.024** |
+| 0.960 | 96–99% | 0.945–0.977 | +0.001–+0.015 | −0.013–−0.027 |
+
+### 9e. Interpretation
+
+- **At floors 0.990/0.980**: no row qualifies for 6-6-7 (per-row weight cosim is
+  too tight). All rows fall back to N=12. The adaptive scheme equals pure N=12.
+
+- **At floor 0.970**: the sweet spot. ~80–96% of rows use 6-6-7, gaining
+  +0.001–+0.036 cosim over pure LUT6 at **zero extra bits** (still 2.667 bpw).
+  Fallback N=12 rows use 12×fp16 + NaN sentinel = 208 bits metadata, same
+  stride as 6-6-7 rows. Index encoding: 5 values into 18 bits = 3.60 bpw
+  for the minority fallback rows.
+
+- **6-6-7 is always strictly better than pure 6-6-6** — the only question is
+  how much better. The gain is largest for gate/up (multiplicative error path)
+  where even a small improvement in per-row LUT quality has compounded benefit.
+
+- The 4 unused byte codewords (256−252=4) are available for future use
+  (e.g. special tokens, escape codes) without any format change.
+
+### 9f. Recommended operating point
+
+For all three projections at **2.667 bpw** (1 byte per 3 values, byte-aligned,
+no packing overhead):
+
+| Projection | Scheme | bpw | cosim range |
+|---|---|---|---|
+| `down_proj` | per-row 6-6-7, floor 0.970 | 2.667* | 0.965–0.991 |
+| `gate_proj` | per-row 6-6-7, floor 0.970 | 2.667* | 0.955–0.979 |
+| `up_proj` | per-row 6-6-7, floor 0.970 | 2.667* | 0.955–0.979 |
+
+\* Minority of rows fall back to N=12 (3.60 bpw index + 208-bit metadata, same
+stride). Weighted average bpw stays ≤ 2.72 (H=8192) / ≤ 2.78 (H=2560).
