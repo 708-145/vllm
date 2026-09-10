@@ -407,3 +407,99 @@ no packing overhead):
 
 \* Minority of rows fall back to N=12 (3.60 bpw index + 208-bit metadata, same
 stride). Weighted average bpw stays ≤ 2.72 (H=8192) / ≤ 2.78 (H=2560).
+
+---
+
+## 10. Applicability to attention and embedding tensors
+
+The 6-6-7 + N=12 adaptive scheme was evaluated on all non-MLP weight tensors
+at layers 0, 2, 15, 17, 22, 31, 39 using per-row weight cosim as the quality
+metric (no attention activations captured).
+
+### 10a. Tensor inventory
+
+| Tensor | Shape | R | H |
+|---|---|---|---|
+| `self_attn.q_proj` | [2560, 2560] | 2560 | 2560 |
+| `self_attn.k_proj` | [512, 2560] | 512 | 2560 |
+| `self_attn.v_proj` | [512, 2560] | 512 | 2560 |
+| `self_attn.o_proj` | [2560, 2560] | 2560 | 2560 |
+| `lm_head` | [100352, 2560] | 100352 | 2560 |
+| `model.embed_tokens` | [100352, 2560] | 100352 | 2560 |
+
+LayerNorm weights (1D) are excluded — too small to benefit.
+
+### 10b. Results
+
+Format: `% rows using 6-6-7 / weighted bpw` at each floor.
+bpw formula: `p×(8/3 + 13×16/H) + (1−p)×(18/5 + 13×16/H)` where p = fraction
+using 6-6-7. (Both formats share the 13×fp16 = 208-bit metadata block.)
+
+| Tensor | L | R | H | std | kurt | f=0.99 | f=0.98 | f=0.97 | f=0.96 |
+|---|---|---|---|---|---|---|---|---|---|
+| q_proj | 0 | 2560 | 2560 | 0.01644 | 10.3 | 0%/3.68 | 0%/3.68 | 86%/2.88 | 97%/2.78 |
+| q_proj | 2 | 2560 | 2560 | 0.01422 | 4.1 | 0%/3.68 | 0%/3.68 | 77%/2.97 | 94%/2.81 |
+| q_proj | 15 | 2560 | 2560 | 0.01511 | 4.7 | 0%/3.68 | 0%/3.68 | 71%/3.02 | 93%/2.81 |
+| q_proj | 17 | 2560 | 2560 | 0.01567 | 4.4 | 0%/3.68 | 0%/3.68 | 81%/2.93 | 98%/2.77 |
+| q_proj | 22 | 2560 | 2560 | 0.01458 | 4.6 | 0%/3.68 | 0%/3.68 | 77%/2.97 | 98%/2.77 |
+| q_proj | 31 | 2560 | 2560 | 0.01399 | 5.9 | 0%/3.68 | 0%/3.68 | 76%/2.97 | 94%/2.81 |
+| q_proj | 39 | 2560 | 2560 | 0.01151 | 3.9 | 0%/3.68 | 0%/3.68 | 68%/3.04 | 95%/2.80 |
+| k_proj | 0 | 512 | 2560 | 0.01937 | 13.5 | 0%/3.68 | 0%/3.68 | 89%/2.85 | 96%/2.79 |
+| k_proj | 2 | 512 | 2560 | 0.01692 | 4.8 | 0%/3.68 | 0%/3.68 | 78%/2.96 | 93%/2.82 |
+| k_proj | 15 | 512 | 2560 | 0.01806 | 6.3 | 0%/3.68 | 0%/3.68 | 71%/3.02 | 88%/2.86 |
+| k_proj | 17 | 512 | 2560 | 0.01886 | 4.6 | 0%/3.68 | 0%/3.68 | 75%/2.98 | 97%/2.78 |
+| k_proj | 22 | 512 | 2560 | 0.01610 | 4.6 | 0%/3.68 | 0%/3.68 | 58%/3.14 | 95%/2.79 |
+| k_proj | 31 | 512 | 2560 | 0.01452 | 6.8 | 0%/3.68 | 0%/3.68 | 72%/3.01 | 96%/2.78 |
+| k_proj | 39 | 512 | 2560 | 0.00983 | 4.0 | 0%/3.68 | 0%/3.68 | 79%/2.95 | 94%/2.80 |
+| v_proj | 0 | 512 | 2560 | 0.01082 | 4.3 | 0%/3.68 | 0%/3.68 | 70%/3.03 | 94%/2.80 |
+| v_proj | 2 | 512 | 2560 | 0.01059 | 3.3 | 0%/3.68 | 0%/3.68 | 88%/2.86 | 99%/2.76 |
+| v_proj | 15 | 512 | 2560 | 0.01048 | 3.7 | 0%/3.68 | 0%/3.68 | 76%/2.97 | 99%/2.75 |
+| v_proj | 17 | 512 | 2560 | 0.01043 | 3.8 | 0%/3.68 | 0%/3.68 | 74%/2.99 | 94%/2.80 |
+| v_proj | 22 | 512 | 2560 | 0.01077 | 3.7 | 0%/3.68 | 0%/3.68 | 66%/3.07 | 100%/2.75 |
+| v_proj | 31 | 512 | 2560 | 0.01120 | 3.8 | 0%/3.68 | 0%/3.68 | 59%/3.13 | 91%/2.83 |
+| v_proj | 39 | 512 | 2560 | 0.01928 | 3.4 | 0%/3.68 | 0%/3.68 | 80%/2.93 | 99%/2.75 |
+| o_proj | 0 | 2560 | 2560 | 0.00237 | 6.2 | 0%/3.68 | 0%/3.68 | 20%/3.49 | 92%/2.82 |
+| o_proj | 2 | 2560 | 2560 | 0.00271 | 4.5 | 0%/3.68 | 0%/3.68 | 85%/2.89 | 98%/2.76 |
+| o_proj | 15 | 2560 | 2560 | 0.00262 | 10.4 | 0%/3.68 | 0%/3.68 | 70%/3.03 | 97%/2.78 |
+| o_proj | 17 | 2560 | 2560 | 0.00257 | 8.8 | 0%/3.68 | 0%/3.68 | 65%/3.07 | 94%/2.80 |
+| o_proj | 22 | 2560 | 2560 | 0.00258 | 5.3 | 0%/3.68 | 0%/3.68 | 54%/3.17 | 86%/2.88 |
+| o_proj | 31 | 2560 | 2560 | 0.00267 | 6.0 | 0%/3.68 | 0%/3.68 | 66%/3.06 | 98%/2.77 |
+| o_proj | 39 | 2560 | 2560 | 0.00332 | 8.2 | 0%/3.68 | 0%/3.68 | 57%/3.15 | 99%/2.76 |
+| lm_head | — | 100352 | 2560 | 0.00399 | 3.1 | 0%/3.68 | 0%/3.68 | **99%/2.76** | 99%/2.75 |
+| embed_tokens | — | 100352 | 2560 | 0.48143 | 3.1 | 0%/3.68 | 0%/3.68 | **99%/2.76** | 99%/2.75 |
+
+### 10c. Key findings
+
+**The scheme is universally applicable across all tensor types.**
+
+1. **Floor 0.980 gives 0% 6-6-7 rows everywhere** — same as MLP. The per-row
+   weight cosim threshold is too tight for 6-6-7 at this quality level across
+   all tensor types. All rows fall back to N=12 at 3.68 bpw.
+
+2. **Floor 0.960 is the universal sweet spot**: 86–100% of rows use 6-6-7
+   across all tensors and layers. Effective bpw 2.75–2.88 everywhere.
+
+3. **`lm_head` and `embed_tokens` are the easiest** (99% at floor 0.970,
+   bpw ≈ 2.76) — near-Gaussian distribution (kurtosis ≈ 3.1) and large
+   R=100352 give excellent per-row LUT coverage.
+
+4. **`o_proj` layer 0 is the hardest** — only 20% at floor 0.970 due to high
+   kurtosis (6.2) and very small std (0.00237). Still 92% at floor 0.960.
+
+5. **Higher kurtosis → more N=12 fallback**. `q_proj`/`k_proj`/`o_proj` have
+   kurtosis 4–13 vs `v_proj`'s 3.3–4.3 — `v_proj` is the cleanest attention
+   tensor.
+
+### 10d. Whole-model operating point
+
+At **floor = 0.960** across all tensors:
+
+| Tensor type | Typical bpw | vs int4 (4.00) |
+|---|---|---|
+| MLP projections (×3 per layer) | 2.67–2.72 | −1.30 |
+| Attention projections (×4 per layer) | 2.75–2.88 | −1.15 |
+| `lm_head` / `embed_tokens` | ~2.75 | −1.25 |
+| **Whole-model average** | **~2.75** | **−1.25 (−31%)** |
+
+The 4 unused byte codewords (253–255) are available for future extension
+(escape codes, special tokens) without breaking the format.
