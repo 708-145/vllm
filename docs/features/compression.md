@@ -503,3 +503,175 @@ At **floor = 0.960** across all tensors:
 
 The 4 unused byte codewords (253–255) are available for future extension
 (escape codes, special tokens) without breaking the format.
+
+---
+
+## 11. Three-mode adaptive encoding: adding an N=4 tier
+
+### 11a. Packing arithmetic
+
+| Mode | Pack rule | Data bpw | Metadata (fp16 per row) | Total bpw (H=2560) | Total bpw (H=8192) |
+|---|---|---|---|---|---|
+| **N=4** | 4⁴ = 256 → 4 vals/byte | **2.000** | 4 | **2.025** | **2.006** |
+| **6-6-7** | 6×6×7 = 252 → 3 vals/byte | **2.667** | 13 | **2.748** | **2.692** |
+| **N=12** | 12⁵ = 248,832 < 2¹⁸ → 5 vals/18 b | **3.600** | 13 | **3.681** | **3.625** |
+
+N=4 metadata is only 4 × fp16 = 64 bits per row (vs 208 bits for the other two
+modes) because the LUT has just 4 levels. The NaN-sentinel trick from Section 9b
+cannot distinguish all three modes in one field; a 2-bit mode tag per row is
+needed (4 unused byte codewords in the 6-6-7 space can serve this purpose).
+
+### 11b. N=4 per-row cosim distribution
+
+Per-row Lloyd-Max with N=4 levels achieves the following cosim across all tensor
+types (verified with vectorized MPS implementation and numpy ground-truth):
+
+| Tensor | N=4 median cosim | N=4 p5 cosim |
+|---|---|---|
+| `down_proj` | ~0.933 | ~0.915 |
+| `gate_proj` / `up_proj` | ~0.941 | ~0.931 |
+| `v_proj` / `q_proj` | ~0.930–0.941 | ~0.914 |
+
+The N=4 cosim distribution is **tightly clustered** (p5–p95 range ≈ 0.03) because
+all weight rows are near-Gaussian: the theoretical Lloyd-Max distortion for a
+Gaussian source at N=4 is fixed by the source entropy, independent of σ.
+
+### 11c. Three-mode sweep results
+
+Evaluated at layers 0, 10, 20, 27, 39 across all five projection types.
+Cheapest mode meeting the floor is selected per row: N=4 first, then 6-6-7,
+then N=12 as unconditional fallback.
+
+**Key finding: N=4 activates only below floor 0.940.**
+
+| Floor | % rows using N=4 | Δbpw vs 2-mode (6-6-7 + N=12) |
+|---|---|---|
+| 0.970 | 0% | 0.000 |
+| 0.960 | 0% | 0.000 |
+| 0.950 | 0% | 0.000 |
+| 0.940 | 0–32% (tensor-dependent) | −0.00 to −0.23 |
+| 0.920 | 90–99% | −0.62 to −0.72 |
+| 0.900 | 96–100% | −0.66 to −0.72 |
+
+At the recommended operating floor of **0.960**, N=4 contributes nothing — the
+2-mode scheme (6-6-7 + N=12) is already optimal.
+
+At floor **0.940**, N=4 activates for 15–32% of `gate_proj`/`up_proj`/`q_proj`
+rows (which have slightly higher σ than `down_proj`), reducing blended bpw from
+~2.75 to ~2.51–2.65, but at the cost of dropping the per-row cosim floor from
+0.950 to 0.940 — roughly a 0.01 quality regression on the weakest rows.
+
+### 11d. Conclusion
+
+N=4 is useful only if the application can tolerate a floor of ~0.93–0.94 per row
+rather than 0.95+. For the recommended 0.960 operating point it adds format
+complexity with zero quality or compression benefit. **The 2-mode (6-6-7 + N=12)
+scheme remains the recommended design.**
+
+---
+
+## 12. LUT sharing granularity
+
+### 12a. Question
+
+Can a shared (global or per-tensor) LUT replace per-row LUTs without
+significant quality loss? This determines whether the 13 × fp16 = 208-bit
+per-row metadata block is necessary.
+
+### 12b. Experimental design
+
+Four schemes compared across all projection types at layers 0, 10, 20, 39:
+
+| Scheme | LUT fitted to | Metadata overhead |
+|---|---|---|
+| **A. per-row** | This row's weights (Lloyd-Max) | 13 × fp16 per row |
+| **B. global raw** | Random sample from all tensors/layers | 13 × fp16 total (model-wide) |
+| **C. global + per-tensor scale** | z-scored global sample; scale = σ(tensor) | 13 × fp16 + 1 × fp16 per tensor |
+| **D. global + per-row scale** | z-scored global sample; scale = σ(row) | 13 × fp16 + 1 × fp16 per row |
+
+For schemes C and D the global LUT lives in unit-variance (z-score) space.
+Weights are divided by the scale before lookup and multiplied back, which is
+equivalent to stretching the LUT by the scale factor.
+
+The global z-LUT6/LUT7 fitted from 2 M pooled z-scored weights:
+
+```
+LUT6 (z): [-2.054, -1.034, -0.318, +0.324, +1.041, +2.062]
+LUT7 (z): [-2.254, -1.253, -0.575, +0.002, +0.580, +1.260, +2.260]
+```
+
+### 12c. Results
+
+Median cosim (Δ relative to per-row baseline):
+
+| Tensor | per-row | global raw Δ | +tensor scale Δ | +row scale Δ |
+|---|---|---|---|---|
+| `down_proj` (H=8192) | 0.970 | **−0.12 to −0.18** | −0.0002 to −0.0005 | −0.0001 to −0.0006 |
+| `gate_proj` / `up_proj` (H=2560) | 0.972 | −0.003 to −0.018 | −0.001 to −0.003 | −0.001 |
+| `v_proj` (H=2560) | 0.972 | −0.004 to −0.013 | −0.001 to −0.004 | −0.001 |
+| `q_proj` (H=2560) | 0.972 | −0.004 to −0.007 | −0.003 to −0.009 | −0.001 |
+
+### 12d. Interpretation
+
+**Global raw LUT is not viable for `down_proj`.**  The down-proj rows have
+σ ≈ 0.004 — roughly 3× narrower than the pooled global distribution
+(σ ≈ 0.012). A global LUT fitted without scale correction wastes its levels
+on the wings of the wide distribution, leaving `down_proj` rows with median
+cosim 0.81–0.85 rather than 0.97.
+
+**Adding a per-tensor scale fully recovers the quality.** The median cosim
+penalty of global + per-tensor scale vs per-row is only −0.0002 to −0.0005
+for `down_proj` and −0.001 to −0.003 for all other tensors. This confirms
+that the weight distribution **shape** is essentially identical across all
+tensor types and layers (all near-Gaussian); only the **scale** differs.
+
+**Per-row scale is marginally better than per-tensor scale** (Δ ≈ 0.001),
+but the difference is negligible in practice.
+
+### 12e. Format implication: global LUT + per-tensor scale
+
+| Component | Global+scale | Per-row LUT |
+|---|---|---|
+| LUT storage | 13 × fp16 once (model-wide) | 13 × fp16 per row |
+| Scale storage | 1 × fp16 per tensor | — |
+| Index data | 8/3 bpw (6-6-7) | 8/3 bpw |
+| **Total bpw (H=2560)** | **2.667 + 16/H_total ≈ 2.667** | **2.748** |
+| **Total bpw (H=8192)** | **2.667 + 16/H_total ≈ 2.667** | **2.692** |
+| Median cosim penalty | −0.001 to −0.003 | — (baseline) |
+
+The per-row LUT metadata contributes `13 × 16 / H` bpw per row:
+- H=2560: +0.081 bpw — a **3.0%** overhead on the index data
+- H=8192: +0.025 bpw — a **0.9%** overhead
+
+With a global LUT + per-tensor scale this metadata collapses to effectively
+zero. The **bpw saving is 0.074–0.081** (at H=2560) vs per-row LUTs, at a
+quality cost of only −0.001 to −0.003 median cosim.
+
+### 12f. Recommended design revision
+
+The global LUT + per-tensor scale is the preferred format:
+
+```
+Model-wide header (stored once):
+  [fp16 × 6: global LUT6]  [fp16 × 7: global LUT7]   = 13 fp16 = 208 bits total
+
+Per-tensor header (one per weight matrix):
+  [fp16: scale]                                         = 1 fp16 = 16 bits
+
+Per-row index data:
+  6-6-7 packed bytes   (2.667 bpw)
+  or N=12 fallback: 5 vals / 18 bits  (3.600 bpw) + 1 bit mode flag per row
+```
+
+Effective whole-model bpw at this design:
+
+| Tensor type | bpw | vs int4 |
+|---|---|---|
+| MLP projections | ~2.67 | −1.33 |
+| Attention projections | ~2.67 | −1.33 |
+| `lm_head` / `embed_tokens` | ~2.67 | −1.33 |
+| **Whole-model** | **~2.67** | **−1.33 (−33%)** |
+
+This is an improvement of ~0.08 bpw over the per-row LUT design (~2.75)
+and ~1.33 bpw below int4, achieved with median cosim ≥ 0.969 across all
+tensor types.
