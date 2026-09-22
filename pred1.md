@@ -1,0 +1,248 @@
+
+# Experimental dynamic MLP sparsity prediction
+
+## Core idea
+
+Evaluate the gate projection in reduced precision. For output values before/after (to be decided) SwiGLU apply a threshold (gate_thresh) to derive hot channels. For the hot channels, compute the full precision values with original weights. The gate output thus consists of approximations for cold channels and correct values for hot channels. 
+Do the same for the up projection: Compute low precision for cold channels and full precision for hot channels. Either the same hot/cold mix as derived from the gate projection. Alternative: for cold gate channels above up_thresh recompute gate and up projection in high precision.
+
+Down projection is different since the hot/cold channels correspond to inputs. Compute the full matrix in low precision. Then add a sparse high precision correction for hot input channels. Needs invention how to implement this efficiently! 
+
+## Experiment 1
+
+As proxy simply use the sign of each weight as low precision value.
+Evaluate cosine similarity of gate output, SwiGLU(gate)*up and down projection output with this predictor scheme versus full precision evaluation.
+
+### Results (granite-4.2-3b, 128 calibration chunks, 10 559 tokens/layer)
+
+All three projections replaced by their sign matrices. Metric: mean per-token
+cosine similarity (sign-approx output vs full-precision output), averaged over
+all 40 layers.
+
+| Stage | Mean | Min | Max |
+|---|---|---|---|
+| gate output (pre-SiLU) | 0.855 | 0.789 | 0.919 |
+| SwiGLU output (= down-proj input) | 0.523 | 0.389 | 0.668 |
+| down projection output | 0.365 | 0.271 | 0.463 |
+
+**Gate** cosine similarity of ~0.85 shows the sign predictor recovers the
+direction of gate logits well — sufficient to identify hot/cold channels.
+
+**SwiGLU drops to ~0.52** because the nonlinearity is most sensitive near
+zero: a wrong sign there flips the whole contribution of that channel.
+
+**Down output at ~0.37** is far too low for the approximation to be used
+as-is. Error from both previous stages compounds through the dense
+down-projection matmul.
+
+**Conclusion:** sign values are a useful routing signal but not a substitute
+for actual computation. The hybrid scheme (sign for routing, full precision
+for hot channels) from the Core Idea section is the necessary next step —
+the approximation output itself must not be passed downstream.
+
+Per-layer detail (layers 0–39):
+
+| Layer | gate | SwiGLU | down |
+|---|---|---|---|
+| 0 | 0.9192 | 0.4734 | 0.3603 |
+| 1 | 0.9142 | 0.3890 | 0.2767 |
+| 2 | 0.8676 | 0.5304 | 0.4352 |
+| 3 | 0.8601 | 0.5225 | 0.3740 |
+| 4 | 0.8546 | 0.5410 | 0.3824 |
+| 5 | 0.8667 | 0.5333 | 0.3906 |
+| 6 | 0.8623 | 0.5093 | 0.3690 |
+| 7 | 0.8765 | 0.5191 | 0.3882 |
+| 8 | 0.8794 | 0.4713 | 0.3341 |
+| 9 | 0.8829 | 0.4738 | 0.3104 |
+| 10 | 0.8762 | 0.4659 | 0.3107 |
+| 11 | 0.8816 | 0.4457 | 0.2955 |
+| 12 | 0.8783 | 0.4551 | 0.3040 |
+| 13 | 0.8832 | 0.4621 | 0.3210 |
+| 14 | 0.8775 | 0.4788 | 0.3441 |
+| 15 | 0.8713 | 0.5104 | 0.3633 |
+| 16 | 0.8642 | 0.5333 | 0.3666 |
+| 17 | 0.8657 | 0.4859 | 0.2708 |
+| 18 | 0.8576 | 0.5228 | 0.3601 |
+| 19 | 0.8502 | 0.5347 | 0.3533 |
+| 20 | 0.8427 | 0.5177 | 0.3347 |
+| 21 | 0.8365 | 0.5434 | 0.3667 |
+| 22 | 0.8388 | 0.5528 | 0.3581 |
+| 23 | 0.8413 | 0.5324 | 0.3587 |
+| 24 | 0.8521 | 0.4859 | 0.3149 |
+| 25 | 0.8476 | 0.4989 | 0.3276 |
+| 26 | 0.8416 | 0.5045 | 0.3188 |
+| 27 | 0.8360 | 0.5315 | 0.3671 |
+| 28 | 0.8416 | 0.5439 | 0.3671 |
+| 29 | 0.8408 | 0.5650 | 0.4107 |
+| 30 | 0.8369 | 0.5657 | 0.4009 |
+| 31 | 0.8429 | 0.5641 | 0.3996 |
+| 32 | 0.8371 | 0.5429 | 0.3891 |
+| 33 | 0.8262 | 0.5314 | 0.3935 |
+| 34 | 0.8342 | 0.5693 | 0.4086 |
+| 35 | 0.8402 | 0.5810 | 0.4102 |
+| 36 | 0.8408 | 0.5857 | 0.4160 |
+| 37 | 0.8264 | 0.5883 | 0.4510 |
+| 38 | 0.8110 | 0.6071 | 0.4489 |
+| 39 | 0.7890 | 0.6680 | 0.4631 |
+
+
+## Experiment 2
+
+Use the sign of each weight as low precision value but implement the hybrid scheme described in the Core Idea section.
+Evaluate cosine similarity of gate output, SwiGLU(gate)*up and down projection output with this predictor scheme versus full precision evaluation.
+
+### Scheme
+
+1. **Low-precision pass:** `gate_approx = sign(W_gate) @ x`,  `up_approx = sign(W_up) @ x`
+2. **Hot mask per token/channel:** `hot = |gate_approx| > gate_thresh`
+3. **Hybrid gate/up:** recompute hot channels with true weights, keep sign values for cold
+4. **SwiGLU hybrid:** `SiLU(gate_hybrid) * up_hybrid`
+5. **Hybrid down:** `sign(W_down) @ swiglu_hybrid` + sparse correction
+   `(W_down − sign(W_down))[:, hot] @ swiglu_hybrid[:, hot]` for the hot channels
+
+### Results (granite-4.2-3b, 128 calibration chunks, 2 000 tokens/layer cap)
+
+Mean cosine similarity across all 40 layers vs full-precision at each `gate_thresh`:
+
+| gate_thresh | hot channels | gate cos-sim | SwiGLU cos-sim | down cos-sim |
+|---|---|---|---|---|
+| 0.0 (all hot = full precision) | 100% | 1.0000 | 1.0000 | 1.0000 |
+| 1.0 | 99.0% | 0.9973 | 0.2107 | 0.0073 |
+| 2.0 | 98.1% | 0.9852 | 0.0766 | 0.0036 |
+| 4.0 | 96.2% | 0.9102 | 0.0302 | −0.0011 |
+| 8.0 | 92.4% | 0.6505 | 0.0183 | −0.0036 |
+| 16.0 | 84.8% | 0.3458 | 0.0276 | 0.0038 |
+
+**Critical finding:** the SwiGLU and down cosine similarity collapse to near zero
+as soon as any channels are left in low precision (`thresh > 0`), even when
+99% of channels are recomputed exactly. The remaining 1% of cold channels
+contribute disproportionately because:
+
+* The SiLU nonlinearity maps a wrong-sign gate logit to a completely wrong
+  output (e.g. sign-approx ≈ −1 vs true value ≈ +3 → SiLU output off by ~4×).
+* These errors are multiplied by the up projection and then spread across all
+  hidden dimensions by the down projection, destroying directional alignment.
+
+**The threshold is applied to the wrong signal.** `|gate_approx|` is the
+magnitude of the sign-approximation (= dot product with ±1 weights), not the
+magnitude of the true gate logit. A small `|gate_approx|` means the true gate
+is also near zero (channels where SiLU ≈ 0 anyway), so those channels are
+actually safe to approximate. A large `|gate_approx|` does not guarantee the
+approximation is accurate — the sign-approx can be large with the wrong sign
+if the true logit has a different magnitude pattern.
+
+**Conclusion:** the hybrid scheme requires a better predictor than the raw
+sign-approximation output as a routing signal. The gate_approx direction is a
+useful sign indicator (experiment 1 showed 0.85 cos-sim for the gate), but
+using it as a magnitude threshold for hot/cold routing fails because the
+residual errors in cold channels dominate the output after nonlinearity.
+The next step is to investigate whether the true gate activations from a prior
+token can serve as a better routing proxy, or whether the threshold should be
+applied to the *residual* `|gate_full − gate_approx|` after a cheap
+correctness check.
+
+
+## Experiment 3
+
+Would a low-rank approximation `W_gate ≈ G_A G_B` (rank 64 or similar) give a
+better gate predictor than the sign matrix?
+
+### Setup
+
+Compute the truncated SVD of `W_gate` (shape 8192×2560) at ranks 4, 16, 64,
+256, 1024 for every layer.  Compare:
+
+1. Gate output cosine similarity vs `gate_raw` — same metric as experiments 1–2.
+2. Sign agreement `frac(sign(gate_approx) == sign(gate_full))` — the routing
+   accuracy that actually determines hybrid-scheme quality.
+3. FLOP cost per token relative to the full GEMM.
+
+### Results (granite-4.2-3b, 40 layers, 2 000 tokens/layer)
+
+#### Gate cosine similarity vs `gate_raw`
+
+| Method | Mean | Notes |
+|---|---|---|
+| Sign predictor `sign(W)` | **0.856** | baseline |
+| Rank-4 SVD | 0.716 | worse |
+| Rank-16 SVD | 0.762 | worse |
+| Rank-64 SVD | 0.817 | worse |
+| Rank-256 SVD | 0.871 | first rank to beat sign |
+| Rank-1024 SVD | 0.947 | — |
+
+The sign predictor beats SVD up to approximately **rank 200**.
+
+#### Sign agreement (routing accuracy for hot/cold split)
+
+Fraction of per-token, per-channel decisions where
+`sign(gate_approx) == sign(gate_full)`:
+
+| Method | Sampled layers mean |
+|---|---|
+| Sign predictor | ~0.867 |
+| Rank-16 SVD | ~0.818 |
+| Rank-64 SVD | ~0.836 |
+| Rank-256 SVD | ~0.858 |
+
+Sign agreement of the low-rank predictor is **lower** than the plain sign
+predictor at all tested ranks.  Rank-256 (~13% of full FLOP cost) only just
+approaches the sign predictor's routing accuracy.
+
+#### FLOP cost per token (W_gate: 8192×2560)
+
+| Method | FLOPs | vs full GEMM |
+|---|---|---|
+| Sign predictor | ~42 M additions (no multiplies) | ≈ 0.1–0.2× |
+| Rank-16 | 344 K | 0.008× |
+| Rank-64 | 1.38 M | 0.033× |
+| Rank-256 | 5.5 M | 0.131× |
+| Full GEMM | 41.9 M | 1.0× |
+
+### Why the sign predictor wins
+
+The singular value spectrum is flat — the top 64 singular values capture only
+15.6% of total spectral energy (r=256 captures 31.9%).  There is no dominant
+low-rank structure.  In this regime, retaining all 8192 weight rows binarized
+to {±1} preserves more directional information than a small set of exact
+low-rank directions.  The sign matrix is equivalent to a full-rank random
+binary projection, which is well-conditioned by the Johnson–Lindenstrauss lemma.
+
+### Conclusion
+
+A low-rank factorization at rank 64 is both **worse as a predictor** (lower
+gate cos-sim, lower sign agreement) and **more expensive** than the sign
+predictor on practical hardware (two dense GEMMs vs one addition-only pass).
+The rank would need to exceed ~200 to match sign-predictor accuracy, at which
+point the cost advantage over the full GEMM is only ~10×.
+
+The sign predictor remains the best cheap proxy for routing.  The routing
+*quality* problem identified in experiment 2 needs a different solution.
+
+
+## Experiment 4
+
+Check if `|gate_approx|` (magnitude of the sign-prediction output) is a better
+routing signal than the raw threshold used in experiment 2.
+
+Specifically: how well does `|gate_approx| = |sign(W_gate) @ x|` predict
+`|gate_full| = |W_gate @ x|`?  A good rank correlation between the two would
+mean the magnitude of the cheap pass reliably identifies the truly-active
+channels, enabling a threshold on `|gate_approx|` to be used for routing with
+acceptable mis-routing rates.
+
+
+## Experiment 5
+
+Use the prior-token hotlist and refine the hotlist for the next token by running
+some channels in full precision out of the critical path.
+
+Scheme:
+1. For token `t` use the hotlist `H_{t-1}` from the previous token (temporal
+   locality hypothesis: hot channels are stable across adjacent tokens).
+2. Compute the full MLP in hybrid mode using `H_{t-1}`.
+3. In parallel (out of the critical path, must finish before layer `l` of token
+   `t+1`): run the gate projection in full precision on a subset of channels
+   to produce an updated hotlist `H_t` for the next token.
+4. Evaluate: how accurate is `H_{t-1}` as a predictor of the true hot channels
+   at token `t`?  What is the SwiGLU and down cosine similarity when routing
+   with the prior-token hotlist?
