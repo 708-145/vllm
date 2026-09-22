@@ -487,3 +487,99 @@ The implication for system design: do not spend the inter-token compute budget
 on refining the hotlist.  Instead, use it for something else entirely — e.g.
 speculative prefetching of the hot channel weights, or running the gate
 projection for the next layer's token concurrently.
+
+## Experiment 7
+
+Scheme similar to experiment 2, but route on the **post-nonlinearity neuron
+magnitude** `|SwiGLU_approx|` instead of the pre-SiLU gate logit.
+
+### Scheme
+
+1. Compute gate and up projections in low precision:
+   `gate_approx = sign(W_gate) @ x`,  `up_approx = sign(W_up) @ x`
+2. Compute the cheap SwiGLU approximation:
+   `swiglu_approx = SiLU(gate_approx) * up_approx`
+3. Select the top-F neurons by `|swiglu_approx|` as hot.
+4. Recompute hot neurons in full precision:
+   `swiglu_hybrid[hot] = SiLU(W_gate[hot,:] @ x) * (W_up[hot,:] @ x)`
+   Cold neurons keep the `swiglu_approx` value.
+5. Down projection with full-precision `W_down`:
+   `out = W_down @ swiglu_hybrid`
+
+Metrics vs full-precision reference (`swiglu_full`, `out_full = W_down @ swiglu_full`):
+- **Neuron cosine similarity**: `cos(swiglu_full, swiglu_hybrid)`
+- **Output cosine similarity**: `cos(out_full, out_hybrid)`
+- **Energy fraction**: fraction of `||swiglu_full||²` contained in hot neurons
+
+### Results (granite-4.2-3b, 40 layers, 2 000 tokens/layer, MPS)
+
+| hot% | neuron cos-sim | out cos-sim | energy in hot | Δ out vs exp4 (same hot%) |
+|---|---|---|---|---|
+| 0.5% | 0.3636 | 0.3155 | 25.0% | n/a |
+| 1.0% | 0.3174 | 0.2714 | 31.3% | n/a |
+| 2.0% | 0.2598 | 0.2175 | 38.8% | n/a |
+| 5.0% | 0.1666 | 0.1325 | 50.5% | n/a |
+| **10.0%** | **0.0906** | **0.0652** | 60.0% | −0.179 vs exp4's 0.245 |
+| **20.0%** | **0.1156** | **0.0948** | 69.2% | −0.102 vs exp4's 0.197 |
+| **30.0%** | **0.3558** | **0.3326** | 74.1% | +0.176 vs exp4's 0.157 |
+
+### Key finding: U-shaped cosine similarity vs hot fraction
+
+The output cosine similarity is **not monotonically increasing** with the hot
+fraction.  It peaks at 0.5% hot (0.316), then *falls* to a minimum near 0.065
+at 10%, then recovers to 0.333 at 30%.  This is a qualitatively different
+failure mode from all previous experiments.
+
+**Why the U-shape occurs:**
+
+The routing signal `|swiglu_approx|` is dominated by the wrong neurons.
+`swiglu_approx = SiLU(gate_approx) * up_approx` inherits the sign errors of
+both the gate and up approximations.  A channel where `gate_approx` has the
+wrong sign produces a strongly *negative* gate logit fed into SiLU, giving a
+large *negative* (or near-zero) SiLU output.  But `up_approx` for that same
+channel may also have the wrong sign, making the product `SiLU(−large) * (−up)`
+potentially large and *positive*.  These sign-error-amplified neurons rank
+high in `|swiglu_approx|` even though their true `swiglu_full` value is near
+zero or has the opposite sign.
+
+In other words: **`|swiglu_approx|` selects the most mis-approximated neurons
+as hot**, not the most active ones.  Recomputing those channels in full
+precision and replacing a large (wrong-sign) approximation with a near-zero
+(correct) value zeroes out a contribution that the cold channels' sign
+approximations were implicitly relying on — destroying the directional alignment
+of `swiglu_hybrid`.
+
+The recovery at 30% occurs because enough neurons are recomputed that the
+correct activations begin to outweigh the damage from correcting the false-large
+ones.  At 0.5% the budget is so small that only the very largest
+`|swiglu_approx|` values are touched — a mixed bag, but there are few enough
+that the overall effect is marginally positive.
+
+**The energy fraction column tells the same story:** at 10% hot, those neurons
+capture 60% of the energy in `swiglu_full` — but they were *selected by*
+`|swiglu_approx|`, and the neuron cosine similarity is only 0.09.  The 10%
+selected channels account for 60% of the true energy, but the approximation
+of those channels is extremely inaccurate (cos-sim 0.09), causing a large
+error.  Contrast with 0.5% hot: only 25% of energy is in hot channels but the
+approximation of *all remaining* channels is relatively accurate, giving higher
+overall cosine similarity.
+
+### Comparison with experiment 4 (routing on |gate_approx|)
+
+At 10% hot, experiment 4 achieves out cos-sim **0.245** vs experiment 7's
+**0.065** — a factor of ~4× worse for SwiGLU-routing at the same budget.
+At 30% hot, experiment 7 finally beats experiment 4 (0.333 vs 0.157), showing
+that at very large budgets the post-nonlinearity routing does eventually win
+because the energy concentration improves (74% of neuron energy at 30%).
+
+### Conclusion
+
+Routing on `|SwiGLU_approx|` is significantly worse than routing on
+`|gate_approx|` at practically useful hot fractions (≤20%).  The compound
+sign errors in both gate and up approximations create a badly misleading
+routing signal that preferentially selects the most mis-approximated neurons
+rather than the most active ones.
+
+The post-nonlinearity signal would only be useful if both gate and up
+approximations were much more accurate to begin with — which would require
+a better predictor (e.g. the prior-token gate vector from experiment 5/6).
