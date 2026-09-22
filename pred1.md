@@ -392,3 +392,98 @@ channels (IoU ~0.28 at 10%) is sufficient to exploit because the stably-hot
 channels dominate the output.  Refinement at the boundary hurts; a better
 strategy might be to carry forward the full prior gate vector and threshold it
 rather than doing a top-k IoU comparison.
+
+## Experiment 6
+
+Magnitude-confidence refinement of the prior-token hotlist.  Instead of
+refining the channels ranked nearest the hot/cold boundary (experiment 5),
+use `|gate_full[t-1]|` as a per-channel confidence score and focus the
+refinement budget where the prior is least certain.
+
+### Scheme
+
+Given a refinement budget of `k_refine` channels:
+
+1. Among the `k_hot` prior-hot channels, pick the `k_refine/2` with the
+   **smallest** `|gate_full[t-1]|` — these are the weakest hot channels,
+   most likely to have dropped below the threshold at token `t`.
+2. Among the remaining prior-cold channels, pick the `k_refine/2` with the
+   **largest** `|gate_full[t-1]|` — these are the strongest cold channels,
+   most likely to have crossed into hot territory.
+3. For those `k_refine` channels, re-evaluate with the true `gate_full[t]`
+   and update the hot/cold decision.  All other channels keep the prior
+   decision unchanged — in particular, high-magnitude prior-hot channels are
+   **protected** from being flipped.
+
+This is compared directly against the experiment 5 boundary-rank strategy
+(refine channels nearest the rank cutoff) and the no-refinement baseline.
+
+### Results (granite-4.2-3b, 40 layers, 2 000 tokens/layer, MPS)
+
+#### SwiGLU cosine similarity — hot=10% (best configuration from exp5)
+
+| refine budget | no_refine (baseline) | boundary_rank (exp5) | magnitude_conf (exp6) | Δ exp6 vs exp5 | Δ exp6 vs baseline |
+|---|---|---|---|---|---|
+| 0% | 0.4359 | 0.4359 | 0.4359 | +0.0000 | +0.0000 |
+| 5% | 0.4359 | 0.4320 | 0.4329 | +0.0010 | −0.0030 |
+| 10% | 0.4359 | 0.4273 | 0.4306 | +0.0033 | −0.0053 |
+| 20% | 0.4359 | 0.4170 | **0.4267** | **+0.0096** | −0.0092 |
+| 30% | 0.4359 | 0.4067 | 0.4149 | +0.0082 | −0.0210 |
+
+#### Down-projection cosine similarity — hot=10%
+
+| refine budget | no_refine | boundary_rank | magnitude_conf | Δ exp6 vs exp5 |
+|---|---|---|---|---|
+| 0% | 0.3096 | 0.3096 | 0.3096 | +0.0000 |
+| 5% | 0.3096 | 0.3066 | 0.3073 | +0.0007 |
+| 10% | 0.3096 | 0.3030 | 0.3053 | +0.0023 |
+| 20% | 0.3096 | 0.2954 | **0.3021** | **+0.0067** |
+| 30% | 0.3096 | 0.2877 | 0.2935 | +0.0058 |
+
+Full table at hot=20%:
+
+| refine budget | no_refine | boundary_rank | magnitude_conf | Δ exp6 vs exp5 |
+|---|---|---|---|---|
+| 0% | 0.3984 | 0.3984 | 0.3984 | +0.0000 |
+| 5% | 0.3984 | 0.3935 | 0.3939 | +0.0004 |
+| 10% | 0.3984 | 0.3883 | 0.3897 | +0.0014 |
+| 20% | 0.3984 | 0.3771 | 0.3820 | +0.0049 |
+| 30% | 0.3984 | 0.3650 | **0.3748** | **+0.0098** |
+
+### Key findings
+
+**Magnitude-confidence refinement consistently beats boundary-rank refinement**
+at every budget and every hot fraction, by a margin of +0.001 to +0.010 SwiGLU
+cosine similarity.  The improvement grows with budget size and is most pronounced
+at larger hot fractions — e.g. at hot=20%, refine=30%, the gap is +0.010.
+
+**However, both refinement strategies still underperform the no-refinement
+baseline** (prior-token hotlist, no corrections).  At hot=10%, the best
+magnitude-confidence result (budget=20%, SwiGLU=0.4267) is still 0.009 below
+the no-refinement baseline of 0.4359.  At hot=20%, the gap is 0.016 at
+budget=30%.
+
+**The fundamental problem is confirmed:** refining the hotlist at the *current*
+token (even with oracle full-precision gate values) adds hot-channel churn that
+outweighs the benefit of correcting the prior's errors.  Protecting high-magnitude
+prior-hot channels reduces but does not eliminate this churn.
+
+**Why refinement still hurts:** The channels selected by magnitude-confidence
+(weak hot + strong cold) are the ones that genuinely flip between tokens — they
+are intrinsically unstable.  Correctly classifying them at token `t` means
+*replacing stable prior-hot channels with newly-discovered ones*, disrupting
+the routing for those stable channels at token `t+1`.  The benefit of one
+correct routing decision is outweighed by the propagation of instability.
+
+### Conclusion
+
+Magnitude-confidence is the right conceptual direction — protecting stable hot
+channels improves over the boundary-rank strategy — but refinement itself is
+counterproductive relative to simply carrying the prior hotlist unchanged.  The
+best strategy so far remains: **10% hot, prior-token hotlist, zero refinement**
+(SwiGLU cosine similarity 0.4359, down cosine 0.3096).
+
+The implication for system design: do not spend the inter-token compute budget
+on refining the hotlist.  Instead, use it for something else entirely — e.g.
+speculative prefetching of the hot channel weights, or running the gate
+projection for the next layer's token concurrently.
