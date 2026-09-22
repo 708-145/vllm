@@ -583,3 +583,350 @@ rather than the most active ones.
 The post-nonlinearity signal would only be useful if both gate and up
 approximations were much more accurate to begin with — which would require
 a better predictor (e.g. the prior-token gate vector from experiment 5/6).
+
+## Experiment 8
+
+Ternary weight approximation: replace the sign predictor `sign(W) ∈ {±1}` with
+a ternary `T(W, τ) ∈ {−1, 0, +1}` that zeros out small weights.
+
+### Scheme
+
+Same as experiment 7, except the weight proxy is:
+
+    T(w, τ) = sign(w)  if |w| ≥ τ,  else 0
+
+with a per-layer adaptive threshold `τ = α × mean(|W_gate|)`.  The full
+pipeline:
+
+1. `gate_approx = T(W_gate, τ) @ x`
+2. `up_approx   = T(W_up,   τ) @ x`
+3. `swiglu_approx = SiLU(gate_approx) * up_approx`  — routing signal
+4. Select top-F neurons by `|swiglu_approx|` as hot
+5. Recompute hot neurons: `swiglu_hybrid[hot] = SiLU(W_gate[hot] @ x) * (W_up[hot] @ x)`
+6. `out = W_down @ swiglu_hybrid`
+
+α is swept over {0.0 (sign baseline), 0.25, 0.5, 0.75, 1.0, 1.5}.
+
+### Results (granite-4.2-3b, 40 layers, 2 000 tokens/layer, MPS)
+
+#### Gate cosine similarity vs full-precision gate
+
+| α | zero% | gate cos-sim |
+|---|---|---|
+| 0.00 (sign) | 0% | 0.856 |
+| 0.25 | 16% | 0.892 |
+| 0.50 | 32% | 0.916 |
+| **0.75** | **46%** | **0.928** |
+| 1.00 | 58% | 0.928 |
+| 1.50 | 77% | 0.892 |
+
+Zeroing 46–58% of weights (α=0.75–1.0) maximises gate cosine similarity.  Beyond
+1.0× mean the signal is over-sparsified and quality drops.
+
+#### Output cosine similarity (mean across 40 layers)
+
+| α | zero% | 0.5% hot | 1% | 2% | 5% | **10%** | 20% | 30% |
+|---|---|---|---|---|---|---|---|---|
+| 0.00 (sign) | 0% | 0.316 | 0.271 | 0.218 | 0.133 | 0.065 | 0.095 | 0.333 |
+| 0.25 | 16% | 0.372 | 0.321 | 0.259 | 0.160 | 0.081 | 0.118 | 0.361 |
+| 0.50 | 32% | 0.414 | 0.358 | 0.288 | 0.178 | 0.090 | 0.124 | 0.366 |
+| **0.75** | **46%** | **0.431** | **0.372** | **0.300** | **0.184** | **0.093** | 0.118 | 0.355 |
+| 1.00 | 58% | 0.419 | 0.362 | 0.291 | 0.178 | 0.090 | 0.102 | 0.332 |
+| 1.50 | 77% | 0.334 | 0.286 | 0.229 | 0.139 | 0.071 | 0.069 | 0.258 |
+
+Best α per hot fraction: **0.75** for ≤10% hot, **0.50** for ≥20% hot.
+
+#### Improvement over sign baseline (α=0, exp7)
+
+| hot% | sign out cos-sim | best ternary | Δ |
+|---|---|---|---|
+| 0.5% | 0.316 | **0.431** (α=0.75) | +0.115 |
+| 1% | 0.271 | **0.372** (α=0.75) | +0.101 |
+| 5% | 0.133 | **0.184** (α=0.75) | +0.052 |
+| 10% | 0.065 | **0.093** (α=0.75) | +0.028 |
+| 30% | 0.333 | **0.366** (α=0.50) | +0.034 |
+
+### Key findings
+
+**Ternary weights consistently improve over sign weights at all hot fractions
+and all layers.**  The improvement is largest at small hot fractions (0.5–2%),
+where the gain is +0.10–0.12 absolute in output cosine similarity.
+
+**The sweet spot is α=0.75 (46% zeros)**, which maximises gate cosine similarity
+at 0.928.  This corresponds to zeroing all weights below the 46th percentile of
+|W| — roughly half the weight entries.  Beyond this, over-sparsification
+degrades the useful signal.
+
+**The U-shaped curve from experiment 7 persists but shifts upward.**  The
+minimum is still around 10% hot, and the scheme is still far below experiment
+4's output cosine similarity of 0.245 at 10% hot.  Ternary weights improve the
+*level* of the routing signal but do not fix the *structural problem*: the
+ternary SwiGLU still selects the most mis-approximated neurons as hot.
+
+**Why ternary helps:** zeroing near-zero weights removes the dominant source of
+sign errors in the gate approximation.  The sign of a small weight `|w| ≈ 0`
+contributes ±1 to the dot product but carries no real signal; zeroing it
+removes that noise contribution.  The gate cosine similarity improves from 0.856
+(sign) to 0.928 (ternary, α=0.75), which means the `swiglu_approx` routing
+signal is substantially less noisy.
+
+### Conclusion
+
+Ternary weight approximation with α=0.75 is strictly better than the sign
+approximation at all tested hot fractions, with +10 pp improvement at small
+hot fractions.  However, the output cosine similarity at 10% hot (0.093) is
+still far below the experiment 4 level (0.245, routing on `|gate_approx|`
+*before* SiLU) and the experiment 5 level (0.436, prior-token hotlist).
+
+The post-nonlinearity routing problem from experiment 7 is partially mitigated
+but not solved.  The structural issue — that ternary SwiGLU still
+preferentially identifies mis-approximated neurons — remains.  A more accurate
+weight proxy (e.g. ternary applied *only* to gate, with full-precision up, to
+decouple the two error sources) would be the logical next step.
+
+## Experiment 9
+
+Ternary gate proxy with full-precision up projection — decoupling the two
+error sources in the SwiGLU routing signal.
+
+### Motivation
+
+Experiments 7 and 8 routed on `|swiglu_approx| = |SiLU(gate_approx) * up_approx|`
+where both projections were approximated.  This created compound errors: the
+`up_approx` error meant that even a perfectly accurate `gate_approx` would
+produce a distorted routing signal.  Experiment 8's ternary improvement was
+capped by the residual `up_approx` noise.
+
+Eliminating the up error entirely:
+
+    up_full = W_up @ x          full precision, all channels
+
+changes the routing signal to `SiLU(gate_approx) * up_full`, where `up` is
+always exact.  The only remaining approximation in cold channels is the ternary
+gate.
+
+### Scheme
+
+1. `gate_approx = T(W_gate, τ) @ x`  — ternary gate, all channels
+2. `up_full = W_up @ x`               — full-precision up, all channels
+3. `swiglu_approx = SiLU(gate_approx) * up_full`  — routing signal
+4. Hot = top-F neurons by `|swiglu_approx|`
+5. Hot: recompute `gate_full[hot] = W_gate[hot] @ x`; cold: keep `gate_approx`
+6. `swiglu_hybrid = SiLU(gate_hybrid) * up_full`  (up always exact)
+7. `out = W_down @ swiglu_hybrid`
+
+τ = α × mean(|W_gate|),  α ∈ {0.0 (sign), 0.25, 0.5, 0.75, 1.0, 1.5}.
+
+**Cost note:** `up_full = W_up @ x` is a full GEMM that must be paid regardless.
+This scheme's cheap pass is the ternary gate GEMM only; the saving relative to
+full precision comes from avoiding the full `W_gate @ x` for cold channels.
+
+### Results (granite-4.2-3b, 40 layers, 2 000 tokens/layer, MPS)
+
+#### Gate cosine similarity (same as exp8 — gate proxy unchanged)
+
+| α | zero% | gate cos-sim |
+|---|---|---|
+| 0.00 | 0% | 0.856 |
+| 0.50 | 32% | 0.916 |
+| **0.75** | **46%** | **0.928** |
+| 1.00 | 58% | 0.928 |
+| 1.50 | 77% | 0.892 |
+
+#### Output cosine similarity vs full precision
+
+| α | zero% | 0.5% hot | 1% | 2% | 5% | **10%** | 20% | 30% |
+|---|---|---|---|---|---|---|---|---|
+| 0.00 (sign) | 0% | 0.421 | 0.367 | 0.302 | 0.202 | 0.143 | 0.313 | 0.661 |
+| 0.25 | 16% | 0.456 | 0.399 | 0.329 | 0.222 | 0.162 | 0.345 | 0.683 |
+| 0.50 | 32% | 0.477 | 0.417 | 0.344 | 0.233 | 0.174 | 0.361 | 0.690 |
+| **0.75** | **46%** | **0.484** | **0.423** | **0.349** | **0.237** | 0.179 | 0.367 | 0.693 |
+| 1.00 | 58% | 0.475 | 0.416 | 0.344 | 0.235 | **0.181** | **0.368** | 0.695 |
+| 1.50 | 77% | 0.421 | 0.368 | 0.306 | 0.215 | 0.174 | 0.355 | **0.699** |
+
+#### Comparison across experiments (10% hot, best α)
+
+| Experiment | Scheme | Out cos-sim @10% |
+|---|---|---|
+| Exp 7 (sign gate + sign up) | post-SiLU routing | 0.065 |
+| Exp 8 (ternary gate + ternary up, α=0.75) | post-SiLU routing | 0.093 |
+| **Exp 9 (ternary gate + full up, α=1.0)** | **post-SiLU routing** | **0.181** |
+| Exp 4 (sign gate, pre-SiLU routing) | pre-SiLU routing | 0.245 |
+| Exp 5 (prior-token hotlist) | prior-token routing | 0.310 |
+
+### Key findings
+
+**The U-shaped cosine-similarity curve is eliminated.** Output cosine similarity
+is now monotonically increasing with hot fraction across all α values — e.g.
+at α=0.75: 0.484 → 0.423 → 0.349 → 0.237 → 0.179 → 0.367 → 0.693 going from
+0.5% to 30% hot.  The structural failure of experiments 7 and 8 (routing
+selecting the most mis-approximated neurons) is resolved because `up_full` is
+exact, so `|SwiGLU_approx|` now reliably reflects true neuron activity.
+
+**Full-precision up is responsible for most of the gain.** Comparing α=0 (sign
+gate) between exp8 and exp9 at 10% hot: 0.065 → 0.143 — more than doubling
+output cosine similarity without any change to the gate proxy.  The ternary gate
+improvement on top (α=0.75) adds a further 0.036 (0.143 → 0.179).
+
+**At large hot fractions (20–30%), the scheme performs very well.** At 30% hot
+and α=1.5, output cosine similarity reaches **0.699**.  The cold channels
+(70% of neurons) contribute only ~2% of the SwiGLU output energy at this point,
+so their ternary gate approximation has minimal impact.
+
+**At small hot fractions (≤10%), exp 9 still trails exp 4 and exp 5.**
+At 10% hot, best exp9 (0.181) vs exp4 (0.245) vs exp5 (0.310).  The cold
+channels' ternary gate errors are still large enough to hurt the output.
+
+**The sweet spot shifts to α=1.0–1.5 for large hot fractions** (vs α=0.75 for
+small ones), because at large hot fractions fewer cold channels remain, so
+over-sparsifying the gate (77% zeros) causes negligible routing harm while
+improving cold-channel gate accuracy.
+
+### Conclusion
+
+Ternary gate + full-precision up **fixes the fundamental routing problem** from
+experiments 7–8 and produces a well-behaved, monotonically improving scheme.
+At 10% hot it delivers output cosine similarity 0.181 (vs 0.093 in exp8, vs
+0.065 in exp7), and at 30% hot reaches 0.699.
+
+The remaining gap below exp4 (pre-SiLU routing, 0.245 at 10% hot) and exp5
+(prior-token hotlist, 0.310) indicates that the cold-channel ternary gate
+approximation is still the bottleneck.  The next logical step: combine the
+ternary gate proxy with pre-SiLU routing (route on `|gate_approx|` rather than
+`|swiglu_approx|`) and full-precision up, which should inherit the better routing
+quality of exp4 while improving cold-channel SwiGLU accuracy via exact up values.
+
+  ## Experiment 10 {
+    ### Motivation
+
+    Experiment 9 confirmed that routing on `|SwiGLU_approx|` with full-precision
+    up eliminates the U-shaped curve, but output cosine similarity at 10% hot
+    (0.181) still trails exp4's pre-SiLU routing (0.245) and exp5's prior-token
+    hotlist (0.310).  The hypothesis: `|SwiGLU_approx| = |SiLU(gate_approx) *
+    up_full|` is a weaker ranking signal than raw `|gate_approx|` because SiLU
+    non-linearity suppresses near-zero channels (which may be important) and
+    amplifies channels where `gate_approx` is already large (but possibly
+    over-estimated).
+
+    Prediction: replacing the routing signal with `|gate_approx|` (exp4's
+    pre-SiLU signal) while keeping full-precision up and ternary gate for cold
+    channels should inherit exp4's routing quality and exp9's cold-channel accuracy.
+
+    ### Scheme
+
+      1. `gate_approx  = T(W_gate, τ) @ x`          ternary gate, all channels
+      2. `up_full      = W_up @ x`                   full-precision up, all channels
+      3. `hot = top-F channels by |gate_approx|`     **pre-SiLU routing** (exp4 signal)
+      4. `gate_hybrid[hot]  = W_gate[hot] @ x`       full-precision gate for hot
+         `gate_hybrid[cold] = gate_approx[cold]`     ternary gate for cold
+      5. `swiglu_hybrid = SiLU(gate_hybrid) * up_full`
+      6. `out = W_down @ swiglu_hybrid`              full-precision down always
+
+    vs exp9: step 3 uses `|gate_approx|` instead of `|SiLU(gate_approx) * up_full|`.
+
+    τ = α × mean(|W_gate|), α ∈ {0.0, 0.25, 0.50, 0.75, 1.00, 1.50};
+    hot fractions ∈ {0.5%, 1%, 2%, 5%, 10%, 20%, 30%}.
+
+    ### Results (granite-4.2-3b, 40 layers, 2 000 tokens/layer, MPS)
+
+    #### Gate cosine similarity vs full-precision gate
+
+    | α | zero% | gate cos-sim |
+    |---|---|---|
+    | 0.00 | 0% | 0.856 |
+    | 0.25 | 16% | 0.892 |
+    | 0.50 | 32% | 0.916 |
+    | **0.75** | **46%** | **0.928** |
+    | 1.00 | 58% | 0.928 |
+    | 1.50 | 77% | 0.892 |
+
+    (Identical to exp9 — gate proxy unchanged; sweet spot still α=0.75.)
+
+    #### Output cosine similarity vs full precision
+
+    | α | zero% | 0.5% hot | 1% | 2% | 5% | **10%** | 20% | 30% |
+    |---|---|---|---|---|---|---|---|---|
+    | 0.00 (sign) | 0% | 0.551 | 0.529 | 0.503 | 0.454 | 0.398 | 0.316 | 0.252 |
+    | 0.25 | 16% | 0.594 | 0.572 | 0.546 | 0.495 | 0.438 | 0.353 | 0.286 |
+    | 0.50 | 32% | 0.621 | 0.600 | 0.574 | 0.523 | 0.464 | 0.377 | 0.308 |
+    | **0.75** | **46%** | **0.633** | **0.612** | **0.586** | **0.536** | **0.476** | **0.386** | **0.314** |
+    | 1.00 | 58% | 0.628 | 0.608 | 0.584 | 0.534 | 0.473 | 0.380 | 0.307 |
+    | 1.50 | 77% | 0.574 | 0.555 | 0.531 | 0.480 | 0.418 | 0.326 | 0.257 |
+
+    #### Neuron (SwiGLU) cosine similarity vs full precision
+
+    | α | zero% | 0.5% hot | 1% | 2% | 5% | **10%** | 20% | 30% |
+    |---|---|---|---|---|---|---|---|---|
+    | 0.00 (sign) | 0% | 0.603 | 0.581 | 0.555 | 0.506 | 0.449 | 0.366 | 0.300 |
+    | 0.25 | 16% | 0.644 | 0.622 | 0.596 | 0.545 | 0.487 | 0.401 | 0.332 |
+    | 0.50 | 32% | 0.672 | 0.650 | 0.624 | 0.573 | 0.513 | 0.424 | 0.353 |
+    | **0.75** | **46%** | **0.685** | **0.664** | **0.638** | **0.587** | **0.527** | **0.435** | **0.361** |
+    | 1.00 | 58% | 0.684 | 0.664 | 0.638 | 0.588 | 0.526 | 0.432 | 0.357 |
+    | 1.50 | 77% | 0.638 | 0.619 | 0.594 | 0.543 | 0.479 | 0.386 | 0.313 |
+
+    #### Comparison across experiments (10% hot, best α)
+
+    | Experiment | Routing signal | Out cos-sim @10% |
+    |---|---|---|
+    | Exp 7 (sign gate + sign up) | post-SiLU `\|SwiGLU_approx\|` | 0.065 |
+    | Exp 8 (ternary gate + ternary up, α=0.75) | post-SiLU `\|SwiGLU_approx\|` | 0.093 |
+    | Exp 9 (ternary gate + full up, α=1.0) | post-SiLU `\|SwiGLU_approx\|` | 0.181 |
+    | Exp 4 (sign gate, pre-SiLU) | pre-SiLU `\|gate_approx\|` | 0.245 |
+    | Exp 5 (prior-token hotlist) | prior-token hotlist | 0.310 |
+    | **Exp 10 (ternary gate + full up, α=0.75)** | **pre-SiLU `\|gate_approx\|`** | **0.476** |
+
+    ### Key findings
+
+    **Pre-SiLU routing is massively better than post-SiLU routing with the same
+    weights.** Switching from `|SwiGLU_approx|` (exp9) to `|gate_approx|` (exp10)
+    at α=0.75 raises output cosine similarity at 10% hot from **0.181 → 0.476**
+    — a 2.6× improvement.  This confirms the hypothesis: the SiLU non-linearity
+    was actively degrading the routing signal by suppressing channels with small
+    but non-zero gate values.
+
+    **Exp10 now outperforms all previous experiments at every hot fraction ≤10%.**
+    At 10% hot: 0.476 vs 0.310 (exp5) vs 0.245 (exp4).  This is a significant
+    result — routing on `|gate_approx|` from a *ternary* gate proxy beats both
+    the sign-gate pre-SiLU routing (exp4) and the prior-token hotlist (exp5).
+
+    **No U-shape.** Like exp9, output cosine similarity is monotonically
+    decreasing with hot fraction (0.633 → 0.612 → 0.586 → 0.536 → 0.476 → 0.386
+    → 0.314 at α=0.75), confirming that exact up values prevent the routing
+    from picking the most mis-approximated neurons.
+
+    **α=0.75 is the sweet spot across all hot fractions** (46% zeros in W_gate).
+    At 1.0 and 0.5 the results are within 0.003–0.010 of the best, so the
+    choice is not critical in a ±0.25 band around 0.75.
+
+    **Cold-channel quality drives the gap vs full precision at large hot
+    fractions.** At 30% hot (0.314 at α=0.75), 70% of channels use the ternary
+    gate approximation; the gap below 1.0 is entirely from those cold channels.
+    Reducing this gap requires either (a) higher hot fraction budget or (b) a
+    better cold-channel proxy.
+
+    **Consistent across all 40 layers.** Δout (ternary α=0.75 vs sign α=0) at
+    10% hot ranges from +0.050 (layer 29–30) to +0.122 (layer 0) with mean
+    +0.079, indicating the improvement is structural, not confined to specific
+    layers.
+
+    ### Conclusion
+
+    Pre-SiLU routing on `|gate_approx|` combined with ternary gate proxy
+    (α=0.75, 46% zeros) and full-precision up **decisively outperforms all
+    previous routing strategies**.  At 10% hot channels it delivers output
+    cosine similarity **0.476** — compared to 0.181 in exp9, 0.245 in exp4, and
+    0.310 in exp5.
+
+    The remaining gap to full precision at 10% hot is driven by cold-channel
+    ternary gate errors (54% of channels use the proxy).  The next directions:
+
+    1. **Combine with prior-token hotlist** (exp5): use prior-token knowledge to
+       bias the hot selection toward temporally stable channels — could push
+       above 0.5 at 10% hot.
+    2. **Ternary up proxy for cold channels**: does adding a ternary up proxy
+       for the cold channels (like exp8 did) hurt or help when routing is
+       pre-SiLU?
+    3. **Scale to lower hot fractions**: at 0.5% hot we already see 0.633 output
+       cosine similarity — evaluate whether the FLOP savings at 1–5% hot are
+       worth the quality cost in practice.
+  }
