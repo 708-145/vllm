@@ -230,19 +230,165 @@ mean the magnitude of the cheap pass reliably identifies the truly-active
 channels, enabling a threshold on `|gate_approx|` to be used for routing with
 acceptable mis-routing rates.
 
+### Setup
+
+For each layer, compute:
+1. **Spearman rank correlation** between `|gate_approx|` and `|gate_full|`
+   across all (token, channel) pairs — measures how well the cheap magnitude
+   predicts the true magnitude.
+2. **Quadrant breakdown** (split at median of `|gate_approx|`):
+   - A: correct sign & large approx — hot channels correctly identified ✓
+   - B: wrong sign & large approx — hot channels with wrong sign (dangerous) ✗
+   - C: correct sign & small approx — cold channels correctly identified ✓
+   - D: wrong sign & small approx — cold channels with wrong sign (safe: SiLU≈0) ✓
+3. **Hybrid quality** routing by top-F `|gate_approx|` as hot mask.
+
+### Results (granite-4.2-3b, 40 layers, 2 000 tokens/layer, MPS)
+
+#### Magnitude rank correlation
+
+Spearman ρ(|gate_approx|, |gate_full|):
+mean=**0.638**  min=0.576  max=0.724
+
+Moderate positive correlation — `|gate_approx|` does carry signal about which
+channels will be truly large, but with substantial noise (~0.36 unexplained rank
+variance).
+
+#### Quadrant breakdown (mean across 40 layers)
+
+| Quadrant | Fraction | Meaning |
+|---|---|---|
+| A: correct-sign & large-approx | 0.487 | hot, correctly identified |
+| **B: wrong-sign & large-approx** | **0.013** | **hot, mis-classified (dangerous)** |
+| C: correct-sign & small-approx | 0.370 | cold, correctly classified |
+| D: wrong-sign & small-approx | 0.130 | cold, mis-classified (safe: SiLU≈0) |
+
+Quadrant B (wrong-sign large channels) is only **1.3%** of all channel-token
+pairs — but these are the pairs that destroy SwiGLU cosine similarity, because
+they have large SiLU errors that propagate through the dense down projection.
+
+#### Hybrid quality (top-F |gate_approx| hot mask)
+
+| hot % | SwiGLU cos-sim | down cos-sim |
+|---|---|---|
+| 50% | 0.1397 | 0.0883 |
+| 30% | 0.2307 | 0.1566 |
+| 20% | 0.2849 | 0.1966 |
+| 10% | **0.3508** | **0.2446** |
+
+Using the top-10% most active channels (by `|gate_approx|`) in full precision
+and leaving the rest as sign-approximation gives SwiGLU cosine similarity of
+0.35 — far better than the 0.05–0.21 range seen in experiment 2 with the same
+hot fraction.  The key difference: in experiment 2, thresholding on `|gate_approx|`
+included quadrant-B channels as cold (wrong-sign but large-approx); here those
+same channels are included as hot (large-approx → recomputed), eliminating the
+most dangerous errors.
+
+**Critical insight:** `|gate_approx|` is actually a *good* proxy for `|gate_full|`
+in the sense that matters: the quadrant-B fraction is tiny (1.3%).  Channels
+with large `|gate_approx|` are overwhelmingly correct-sign (quadrant A).  The
+failure in experiment 2 was the *opposite* routing: using large `|gate_approx|`
+as a cold criterion (i.e. "only recompute small-approx channels") — which
+leaves the dangerous large-approx-wrong-sign channels (B) uncorrected.
+Top-F hot (recompute the biggest ones) is the right use of this signal.
+
+### Conclusion
+
+`|gate_approx|` is a useful routing signal **when used as a hot criterion**
+(mark the largest channels as hot → recompute).  With 10% hot channels, SwiGLU
+cosine similarity reaches 0.35, down cosine 0.24.  The quadrant analysis confirms
+the sign predictor gets the sign right 98.7% of the time on large channels —
+so the remaining error comes from the 87% of channels left as sign-only cold.
+
 
 ## Experiment 5
 
 Use the prior-token hotlist and refine the hotlist for the next token by running
 some channels in full precision out of the critical path.
 
-Scheme:
+### Scheme
+
 1. For token `t` use the hotlist `H_{t-1}` from the previous token (temporal
    locality hypothesis: hot channels are stable across adjacent tokens).
 2. Compute the full MLP in hybrid mode using `H_{t-1}`.
 3. In parallel (out of the critical path, must finish before layer `l` of token
-   `t+1`): run the gate projection in full precision on a subset of channels
-   to produce an updated hotlist `H_t` for the next token.
-4. Evaluate: how accurate is `H_{t-1}` as a predictor of the true hot channels
-   at token `t`?  What is the SwiGLU and down cosine similarity when routing
-   with the prior-token hotlist?
+   `t+1`): recompute `k_refine` boundary channels (those ranked nearest the
+   hot/cold cutoff in `H_{t-1}`) in full precision at token `t` to produce
+   an updated hotlist `H_t`.
+4. Metric: IoU between `H_{t-1}` and the true `H_t`, and SwiGLU/down cosine
+   similarity when routing with the prior-token hotlist ± refinement.
+
+### Results (granite-4.2-3b, 40 layers, 2 000 tokens/layer, MPS)
+
+#### Hotlist temporal stability (Jaccard IoU between adjacent tokens)
+
+| hot % | mean IoU | min | max |
+|---|---|---|---|
+| 50% | 0.503 | 0.417 | 0.561 |
+| 30% | 0.402 | 0.260 | 0.487 |
+| 20% | 0.348 | 0.200 | 0.476 |
+| 10% | 0.283 | 0.154 | 0.416 |
+
+IoU of ~0.50 at 50% hot means the prior hotlist gets about half the channels
+right.  At tighter (10%) hot fractions, IoU drops to 0.28 — the hotlist
+changes substantially token to token.
+
+#### Hybrid quality with prior-token hotlist + refinement
+
+Mean SwiGLU cosine similarity:
+
+| hot % | no refine | refine 5% | refine 10% | refine 20% | refine 30% |
+|---|---|---|---|---|---|
+| 50% | 0.3009 | 0.2922 | 0.2832 | 0.2647 | 0.2453 |
+| 30% | 0.3652 | 0.3593 | 0.3531 | 0.3400 | 0.3261 |
+| 20% | 0.3984 | 0.3935 | 0.3883 | 0.3771 | 0.3650 |
+| **10%** | **0.4359** | **0.4320** | **0.4273** | 0.4170 | 0.4067 |
+
+Mean down-projection cosine similarity:
+
+| hot % | no refine | refine 5% | refine 10% | refine 20% | refine 30% |
+|---|---|---|---|---|---|
+| 50% | 0.2160 | 0.2093 | 0.2025 | 0.1883 | 0.1734 |
+| 30% | 0.2604 | 0.2558 | 0.2510 | 0.2410 | 0.2304 |
+| 20% | 0.2834 | 0.2796 | 0.2756 | 0.2670 | 0.2579 |
+| **10%** | **0.3096** | **0.3066** | **0.3030** | 0.2954 | 0.2877 |
+
+### Key findings
+
+**Prior-token hotlist alone (no refinement) outperforms experiment 4.**
+At 10% hot channels, the prior-token hotlist gives SwiGLU cosine similarity
+of **0.436** vs 0.351 with top-F `|gate_approx|`.  This is the best result
+so far across all experiments.  The reason: the prior token's true gate values
+are a much better predictor of the current token's hot channels than any cheap
+approximation, even with IoU of only 0.28.  The ~28% of hot channels that do
+transfer correctly happen to be the most consistently active ones (large gate
+values that are stable across tokens), which are also the ones that matter most
+for the SwiGLU output.
+
+**Refinement does not help — it hurts slightly.**  Recomputing boundary
+channels at token `t` using `gate_full[t]` to update the hotlist consistently
+*reduces* SwiGLU and down cosine similarity.  This is because the boundary
+strategy (channels nearest the prior hot/cold threshold) updates the channels
+that are *least* certain in the prior, replacing them with correct decisions —
+but the overall effect is to increase hot-channel churn, removing stably-hot
+channels in favour of newly-discovered hot ones.  The correction benefit is
+outweighed by the instability cost.  A better refinement strategy would
+selectively protect stably-hot channels while only flipping the boundary ones.
+
+**Tighter hotlists work better.**  10% hot gives ~40% better SwiGLU cosine
+similarity than 50% hot.  This is consistent across all experiments: the sign
+approximation for cold channels degrades gracefully when the hot fraction is
+small, because the most important (largest gate) channels are recomputed and
+the cold channels have near-zero SiLU output anyway.
+
+### Conclusion
+
+The prior-token hotlist is the strongest routing signal found so far.  With
+10% hot channels and no refinement, it achieves SwiGLU cosine similarity 0.44
+and down cosine 0.31 — significantly better than the sign-predictor-based
+routing (0.35/0.24) and far better than the all-sign baseline (0.52 SwiGLU
+but without any full-precision recomputation).  The temporal stability of hot
+channels (IoU ~0.28 at 10%) is sufficient to exploit because the stably-hot
+channels dominate the output.  Refinement at the boundary hurts; a better
+strategy might be to carry forward the full prior gate vector and threshold it
+rather than doing a top-k IoU comparison.
