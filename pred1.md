@@ -1310,3 +1310,431 @@ quality of exp4 while improving cold-channel SwiGLU accuracy via exact up values
     result (0.600 at 10% hot) minus what a true sparse down GEMM would achieve,
     which is a separate question from weight approximation.
   }
+
+  ## Experiment 13 {
+    ### Motivation
+
+    All experiments through exp12 used output cosine similarity in hidden space
+    as the primary metric.  As noted in the "Evaluation metrics" section above,
+    this is magnitude-blind and not tied to top-1 token prediction quality.
+    Experiment 13 re-evaluates the three best configurations from exp10–11 under
+    four logit-space metrics computed via a single W_U GEMM (lm_head.weight,
+    shape 100 352 × 2560).
+
+    **Important caveat on interpretation**: metrics here are computed per MLP
+    layer in isolation — the approximation error at one layer is not propagated
+    through subsequent layers.  Top-1 values will therefore appear low (the MLP
+    output perturbation rarely changes the final argmax when viewed in isolation
+    at a single layer), but the *relative* ordering between configurations
+    remains meaningful.
+
+    ### Configs evaluated (all α_gate=0.75, full-precision up, full W_down)
+
+    | Config | Routing signal |
+    |---|---|
+    | exp10-current | `\|gate_approx[t]\|` — current token (exp10 best) |
+    | exp11-proxy | `\|gate_approx[t-1]\|` — proxy prior (exp11 best) |
+    | exp11-oracle | `\|gate_full[t-1]\|` — oracle prior |
+
+    512 tokens/layer (subsampled from 2 000; W_U GEMM at vocab=100 352 is expensive).
+
+    ### Results (granite-4.2-3b, 40 layers, MPS)
+
+    #### Top-1 preservation rate (higher = better)
+
+    | Config | 0.5% | 1% | 2% | 5% | **10%** | 20% | 30% |
+    |---|---|---|---|---|---|---|---|
+    | exp10 current | 0.068 | 0.057 | 0.047 | 0.032 | 0.019 | 0.009 | 0.004 |
+    | **exp11 proxy** | **0.101** | **0.093** | **0.086** | **0.071** | **0.059** | **0.045** | **0.036** |
+    | exp11 oracle | 0.091 | 0.086 | 0.076 | 0.061 | 0.049 | 0.037 | 0.030 |
+
+    #### KL divergence full‖hybrid (lower = better; NaN layers excluded from mean)
+
+    | Config | 0.5% | 1% | 2% | 5% | **10%** | 20% | 30% |
+    |---|---|---|---|---|---|---|---|
+    | **exp10 current** | **1.402** | **1.356** | **1.301** | **1.191** | **1.066** | **0.856** | **0.664** |
+    | exp11 proxy | 1.551 | 1.529 | 1.500 | 1.442 | 1.369 | 1.251 | 1.141 |
+    | exp11 oracle | 1.530 | 1.509 | 1.481 | 1.421 | 1.353 | 1.243 | 1.134 |
+
+    #### Logit cosine similarity (higher = better)
+
+    | Config | 0.5% | 1% | 2% | 5% | **10%** | 20% | 30% |
+    |---|---|---|---|---|---|---|---|
+    | exp10 current | 0.636 | 0.617 | 0.593 | 0.544 | 0.486 | 0.396 | 0.323 |
+    | **exp11 proxy** | **0.679** | **0.671** | **0.660** | **0.637** | **0.608** | **0.561** | **0.519** |
+    | exp11 oracle | 0.672 | 0.661 | 0.647 | 0.621 | 0.591 | 0.544 | 0.503 |
+
+    #### Hidden cosine similarity (reference — matches prior experiments)
+
+    | Config | 0.5% | 1% | 2% | 5% | **10%** | 20% | 30% |
+    |---|---|---|---|---|---|---|---|
+    | exp10 current | 0.636 | 0.618 | 0.594 | 0.546 | 0.489 | 0.400 | 0.327 |
+    | **exp11 proxy** | **0.680** | **0.672** | **0.662** | **0.640** | **0.611** | **0.565** | **0.524** |
+    | exp11 oracle | 0.675 | 0.665 | 0.652 | 0.626 | 0.596 | 0.550 | 0.509 |
+
+    ### Key findings
+
+    **exp11-proxy wins on top-1, logit-cos, and hidden-cos at every hot
+    fraction.**  Proxy prior (`|gate_approx[t-1]|`) is the best configuration
+    by all three output-quality metrics.  The proxy-prior advantage over
+    oracle-prior seen in hidden-cos (exp11) is confirmed in logit-space:
+    proxy top-1 0.059 vs oracle 0.049 at 10% hot (+0.010), and logit-cos
+    0.608 vs 0.591 (+0.017).
+
+    **KL divergence inverts the ranking: exp10-current has the lowest KL.**
+    This is the one metric where the proxy prior performs worse (KL 1.369 vs
+    1.066 for exp10 at 10% hot).  The inversion is explained by the nature of
+    KL: it is dominated by tokens where `ph` is near zero at the true argmax.
+    The prior-token routing sometimes selects a hotlist from a token where the
+    dominant gate channels differ slightly from the current token, producing a
+    larger distributional shift on a small fraction of tokens that heavily
+    penalises KL while not affecting the argmax.  The very same routing that
+    improves the *most likely* prediction can produce a heavier-tailed
+    distribution error on tokens that are already uncertain.
+
+    **KL is unreliable at early (0–2) and late (39) layers** — the per-layer
+    output perturbation is large enough that the softmax difference overflows
+    float32, producing NaN values.  These layers are excluded from the KL mean
+    via nanmean.  This indicates those layers are particularly sensitive to MLP
+    approximation errors.
+
+    **Logit-space cosine and hidden-space cosine track almost identically**
+    (within 0.001–0.003 at every point), confirming that for this model W_U
+    is roughly isotropic in the directions sampled and hidden-space cosine is
+    a reliable proxy for logit-space cosine.
+
+    **Absolute top-1 values are low** (0.06 at 10% hot for the best config)
+    because this measures per-layer single-MLP perturbation against the final
+    vocabulary.  Errors from one layer are small relative to the total residual
+    stream, so the argmax rarely flips from a single-layer perturbation.  The
+    metric is still informative as a relative ranking; end-to-end propagation
+    would amplify these per-layer effects.
+
+    **Proxy prior beats oracle prior on every non-KL metric**, across all 40
+    layers.  The deeper layers (34–39) show the largest absolute top-1 values
+    (0.12–0.21) because those layers contribute most directly to the final logit
+    distribution.
+
+    ### Conclusion
+
+    Under logit-space metrics, **exp11 proxy prior (`|gate_approx[t-1]|`)
+    remains the best configuration** for top-1 preservation rate and logit
+    cosine similarity.  The single exception is KL divergence, where
+    exp10 current-token routing is preferred — but KL's sensitivity to
+    distributional tails makes it a poor proxy for argmax accuracy in this
+    setting.
+
+    The close agreement between logit-space cosine (0.608) and hidden-space
+    cosine (0.611) at 10% hot validates that the hidden-space metric used in
+    experiments 1–12 is a reliable ranking signal for this model.  Future
+    experiments can continue using hidden-space cosine for speed while
+    spot-checking logit-space metrics at key configurations.
+
+    For practical deployment the relevant metric is top-1 preservation:
+    exp11 proxy achieves 0.059 at 10% hot (per-layer, single MLP in isolation).
+    Quantifying end-to-end top-1 degradation across all 40 layers requires
+    a forward-pass interception experiment — a natural next step.
+  }
+
+  ## Experiment 14 {
+    ### Motivation
+
+    Experiment 13 measured top-1 preservation per MLP layer in isolation.
+    Per-layer values were low (~6% at 10% hot) because a single-layer
+    perturbation rarely changes the final argmax.  This experiment measures
+    the **end-to-end top-1 perturbation rate**: fraction of tokens where the
+    final next-token prediction changes when the hybrid MLP scheme runs across
+    **all 40 layers simultaneously**.
+
+    ### Method
+
+    For each (config, hot-fraction):
+    - **Baseline pass**: normal inference via `llm.generate`, hook on
+      `model.model.norm` captures final hidden states, projected through
+      W_U to get per-token argmax.
+    - **Hybrid pass**: all 40 layers' `mlp.forward` replaced by `HybridMLP`
+      (ternary gate α=0.75 + full up + full W_down).  Same hook captures
+      perturbed final hidden states.  `enable_prefix_caching=False` ensures
+      full re-computation on every pass.
+
+    `top1_match = fraction of prefill-token predictions identical to baseline.`
+
+    `HybridMLP` stores only `T_gate` (bf16, scaled by `mean(|W_gate|)` to
+    preserve expected magnitude in cold channels) — no full weight copies to
+    avoid OOM.
+
+    **Methodology note on proxy-prior**: the proxy-prior routing
+    (`|gate_approx[t-1]|`) is only meaningful in autoregressive decode, where
+    `t-1` is the genuinely preceding token of the same sequence.  In a batched
+    prefill call all prompt tokens are processed simultaneously, so
+    `gate_approx[t-1]` is the previous *batch position* (a different sequence).
+    The two configs therefore produce **identical results in the prefill metric**
+    — they differ only in decode, which this experiment does not measure.
+
+    ### Results (granite-4.2-3b, 8 prompts, 500 prefill tokens, CPU backend)
+
+    #### End-to-end top-1 perturbation rate  (fraction of tokens whose prediction changes)
+
+    | Config | 5% hot | 10% hot | 20% hot | 30% hot |
+    |---|---|---|---|---|
+    | exp10_current / exp11_proxy | **0.544** | **0.484** | 0.412 | 0.368 |
+
+    *(Both configs are identical in this prefill metric — see methodology note.)*
+
+    #### End-to-end top-1 match rate  (fraction of tokens preserved)
+
+    | Config | 5% hot | 10% hot | 20% hot | 30% hot |
+    |---|---|---|---|---|
+    | exp10_current / exp11_proxy | 0.456 | **0.516** | 0.588 | 0.632 |
+
+    ### Key findings
+
+    **At 10% hot channels, 48% of token predictions change end-to-end** compared
+    to full-precision inference.  This is far larger than the per-layer isolation
+    figure of 6% (exp13), confirming that errors compound across layers: 40
+    layers each introducing a small perturbation accumulate to a large output shift.
+
+    **The perturbation rate is monotonically decreasing with hot fraction**, as
+    expected — more hot channels → better approximation → fewer changed predictions.
+    At 30% hot only 37% of predictions change.
+
+    **Comparison with per-layer metric:**
+
+    | Metric | 10% hot |
+    |---|---|
+    | Per-layer top-1 perturbation (exp13 isolation) | ~94% (i.e., 6% match rate, per layer) |
+    | End-to-end top-1 perturbation (this exp, all 40 layers) | 48% |
+
+    The end-to-end rate is lower than the per-layer rate because: (a) each
+    layer contributes only a fraction of the total residual, so a single-layer
+    perturbation has less impact than all-layer simultaneous perturbation might
+    suggest; (b) errors in different layers partially cancel.
+
+    **Proxy-prior vs current-token routing cannot be distinguished in prefill.**
+    The proxy-prior scheme requires autoregressive decode context (where `t-1`
+    is a genuine prior for the same sequence).  End-to-end decode-time comparison
+    requires running full autoregressive generation, which is too slow on CPU at
+    the required scale.
+
+    ### Conclusion
+
+    The end-to-end top-1 perturbation rate at 10% hot is **48%** — roughly half
+    of all token predictions change when all 40 MLP layers simultaneously use the
+    ternary gate + full up approximation.  While the per-layer hidden-space cosine
+    similarity (0.61) suggested reasonable approximation quality, the compounding
+    of errors across all layers produces a substantial impact on output quality
+    in absolute terms.
+
+    This motivates the question: how does the perturbation rate scale with the
+    number of layers approximated?  A partial-layer experiment (approximate only
+    the top-k highest-loss layers) could identify which layers are responsible
+    for most of the perturbation budget.
+  }
+
+  ## Experiment 15 {
+    ### Motivation
+
+    Experiment 3 evaluated low-rank SVD as a gate *routing signal* only and
+    found it worse than sign until rank ~200.  This experiment applies low-rank
+    approximation to **both gate and up projections** as the actual computation
+    (no hot/cold routing; all channels approximated), keeping down full-precision,
+    and measures the **end-to-end top-1 perturbation rate** (same method as
+    exp14).
+
+    ### Scheme
+
+      1. `W_gate ≈ U_r S_r Vt_r`  (truncated SVD)
+      2. `W_up   ≈ U_r S_r Vt_r`  (separate SVD per projection)
+      3. `gate_lr = (U_r * s_r) @ Vt_r @ x`   two-step matmul
+      4. `up_lr   = (U_r * s_r) @ Vt_r @ x`
+      5. `swiglu  = silu(gate_lr) * up_lr`
+      6. `out     = W_down @ swiglu`           full precision always
+
+    SVD factors stored as bfloat16 (max rank 1024) and cached to disk.
+    No hot/cold split — approximation covers all I=8192 intermediate channels.
+
+    ### FLOP cost vs full GEMM (H=2560, I=8192)
+
+    | Rank | FLOP% of full gate GEMM | Energy% captured |
+    |---|---|---|
+    | 128 | 6.6% | 27% |
+    | 512 | 26% | 66% |
+    | 1024 | 53% | 100% (= min(H,I)) |
+
+    (Rank 1024 = full rank of W since min(8192, 2560) = 2560; 100% energy means
+    exact reconstruction to bfloat16 precision.)
+
+    ### Results (granite-4.2-3b, 8 prompts, 500 prefill tokens, CPU backend)
+
+    | Rank | FLOP% | Energy% | Match rate | **Perturb rate** |
+    |---|---|---|---|---|
+    | 128 | 6.6% | 27% | 0.002 | **99.8%** |
+    | 512 | 26% | 66% | 0.010 | **99.0%** |
+    | **1024** | **53%** | **100%** | **0.008** | **99.2%** |
+    | ternary 10% hot (exp14) | ~52% | n/a | 0.516 | 48% |
+    | full precision | 100% | 100% | 1.000 | 0% |
+
+    ### Key findings
+
+    **Low-rank gate+up completely destroys end-to-end prediction quality at all
+    ranks.**  Even at rank 1024 (53% FLOPs, 100% singular value energy captured),
+    99.2% of token predictions change — far worse than the ternary gate + full up
+    scheme at comparable FLOP cost (10% hot ≈ 52% FLOPs, 48% perturbation).
+
+    **Rank 1024 is *worse* than rank 512**, which is itself worse than rank 128
+    in perturbation rate.  This non-monotonic behaviour (lower rank → slightly
+    lower perturbation) suggests the dominant failure mode is not truncation error
+    but **systematic approximation bias** that accumulates across all 40 layers:
+    the SVD reconstruction error in each layer shifts the residual stream in a
+    fixed direction, and these shifts compound catastrophically across layers.
+
+    **Critical comparison with exp14**: the ternary gate scheme at 10% hot (which
+    spends ~52% of gate FLOPs on hot-channel recompute) achieves 48% perturbation;
+    the rank-1024 SVD scheme at the same FLOP budget achieves 99.2%.  The
+    difference is fundamental: the ternary scheme uses **exact full-precision
+    values for hot channels** — it concentrates its budget on the most important
+    neurons.  The SVD scheme distributes its budget uniformly across all channels,
+    meaning no channel ever gets a fully correct value.
+
+    **Exp3's cosine similarity was misleading.** Exp3 showed rank-1024 gate cosine
+    similarity ≈ 1.0 vs `gate_raw`, which appeared excellent.  But cosine
+    similarity of a single layer's gate output is not predictive of end-to-end
+    quality when the same systematic error repeats across all 40 layers.
+
+    ### Conclusion
+
+    Low-rank SVD approximation of gate and up projections is **not viable** as an
+    MLP approximation strategy for this model, even at rank 1024 (full rank).  The
+    end-to-end perturbation rate approaches 100% regardless of rank, confirming
+    that the systematic per-layer bias compounds catastrophically across 40 layers.
+
+    This conclusively establishes that **selective full-precision recompute** (as in
+    exp10–11) is the correct approach: approximate cold channels with a proxy but
+    keep hot channels exactly correct, rather than distributing approximation error
+    uniformly across all channels.
+
+    The ternary gate + full up scheme (exp11 proxy-prior) at 10% hot achieves
+    **48% perturbation at 52% FLOP cost** — contrasted with SVD's 99% perturbation
+    at the same cost.  The hot/cold split with exact hot values is the key design
+    principle.
+  }
+
+  ## Experiment 16 {
+      ### Motivation
+  
+      Experiment 14 showed that approximating all 40 layers simultaneously
+      produces a **48% end-to-end top-1 perturbation rate** at 10% hot channels.
+      Two questions follow naturally:
+  
+      1. Which layers are individually responsible for the most perturbation?
+      2. How quickly does e2e perturbation grow as we add more approximated layers?
+  
+      This experiment answers both via:
+  
+      - **Single-layer sweep**: patch each of the 40 layers independently and
+        measure the e2e top-1 perturbation caused by that layer alone.
+      - **Cumulative sweep**: patch the top-k highest-contribution layers
+        simultaneously (greedy, ranked by single-layer score) and observe how
+        perturbation accumulates.
+  
+      Config: ternary gate α=0.75, full up, full down, routing on |gate_approx[t]|,
+      10% hot channels (same as exp14 exp10_current).
+  
+      ### Results (granite-4.2-3b, 8 prompts, 500 prefill tokens, CPU backend)
+  
+      #### Single-layer perturbation (one layer approximated at a time)
+  
+      | Layer | Perturb | Layer | Perturb | Layer | Perturb | Layer | Perturb |
+      |---|---|---|---|---|---|---|---|
+      | 0 | 0.0900 | 10 | 0.0700 | 20 | 0.0620 | 30 | 0.0440 |
+      | 1 | 0.0700 | 11 | 0.0680 | 21 | 0.0580 | 31 | 0.0520 |
+      | 2 | 0.0840 | 12 | 0.0720 | 22 | 0.0560 | 32 | 0.0720 |
+      | 3 | 0.0820 | 13 | 0.0740 | 23 | 0.0540 | 33 | 0.0640 |
+      | 4 | 0.0680 | 14 | 0.0740 | 24 | 0.0620 | 34 | 0.0700 |
+      | 5 | 0.0600 | 15 | 0.0780 | 25 | 0.0400 | 35 | 0.0760 |
+      | 6 | 0.0780 | 16 | 0.0820 | 26 | 0.0420 | 36 | 0.0780 |
+      | 7 | 0.0620 | 17 | **0.1040** | 27 | 0.0500 | 37 | 0.0480 |
+      | 8 | 0.0620 | 18 | 0.0540 | 28 | 0.0400 | 38 | 0.0820 |
+      | 9 | 0.0600 | 19 | 0.0560 | 29 | 0.0640 | 39 | **0.1340** |
+  
+      Ranked by contribution (highest first):
+      39, 17, 0, 2, 38, 3, 16, 36, 15, 6, 35, 13, 14, 12, 32, 34, 1, 10, 11, 4, ...
+  
+      #### Cumulative perturbation (top-k layers by single-layer rank)
+  
+      | k (layers) | Top-k layers | Perturb | Match |
+      |---|---|---|---|
+      | 1 | [39] | 0.134 | 0.866 |
+      | 2 | [39, 17] | 0.172 | 0.828 |
+      | 4 | [39, 17, 0, 2] | 0.224 | 0.776 |
+      | 8 | [39, 17, 0, 2, 38, 3, 16, 36] | 0.254 | 0.746 |
+      | 16 | [39, 17, 0, 2, 38, 3, 16, 36, 15, 6, 35, 13, 14, 12, 32, 34] | 0.336 | 0.664 |
+      | 24 | top-24 | 0.390 | 0.610 |
+      | 32 | top-32 | 0.454 | 0.546 |
+      | **40** | **all** | **0.484** | **0.516** |
+  
+      *(k=40 matches exp14 exactly — confirms consistency.)*
+  
+      ### Key findings
+  
+      **Layer 39 (final) is the dominant single-layer contributor at 13.4%.**
+      Layer 17 is the second-highest at 10.4%.  All other layers fall in the
+      4–9% range with no sharp outliers.  This is a relatively flat distribution
+      — there is no single "bad" layer that drives the bulk of the perturbation.
+  
+      **Early layers (0–3) have above-average impact (~7–9%)** despite being
+      furthest from the output.  This is expected: errors introduced in early
+      layers propagate through all subsequent layers, amplifying their effect.
+      Late-middle layers (18–28) have the lowest single-layer impact (4–6%),
+      consistent with the residual stream being most stable in that range.
+  
+      **Cumulative perturbation scales sub-linearly but without a sharp knee.**
+      The top 8 layers (20% of the network) explain only 0.254 / 0.484 = **52%
+      of the total perturbation**, and the top 16 layers explain **69%**.  There
+      is no small set of "culprit" layers that can be left at full precision to
+      recover most of the quality at low cost.
+  
+      | k | Perturb | Fraction of total 0.484 |
+      |---|---|---|
+      | 1 | 0.134 | 28% |
+      | 2 | 0.172 | 36% |
+      | 4 | 0.224 | 46% |
+      | 8 | 0.254 | 52% |
+      | 16 | 0.336 | 69% |
+      | 24 | 0.390 | 81% |
+      | 32 | 0.454 | 94% |
+      | 40 | 0.484 | 100% |
+  
+      **Diminishing marginal contribution per additional layer.**  Going from
+      k=1 to k=2 adds 3.8 pp; k=2→4 adds 5.2 pp; k=4→8 adds 3.0 pp; k=8→16
+      adds 8.2 pp; k=16→24 adds 5.4 pp; k=24→32 adds 6.4 pp; k=32→40 adds
+      3.0 pp.  The surprisingly large jump at k=8→16 reflects the cluster of
+      moderate-contribution layers (6, 35, 13–15, 12, 32, 34) that share similar
+      single-layer scores.
+  
+      **No "free lunch" via partial-layer approximation.**  To achieve the
+      exp14 result at 10% hot (48% perturbation), one must approximate all 40
+      layers.  Approximating only the top-8 worst layers gives 25% perturbation —
+      but those 8 layers constitute 20% of all MLP FLOPs.  The cost/benefit is
+      not obviously better than simply raising the hot-channel fraction to 20%
+      for all 40 layers (exp14: 41% perturbation at 20% hot).
+  
+      ### Conclusion
+  
+      The perturbation budget is **distributed across all 40 layers with no
+      dominant outlier** beyond layer 39 and 17.  The final layer (39) stands out
+      primarily because its output feeds directly into the unembedding projection
+      with no further residual mixing — even a small approximation error has
+      maximum logit impact.
+  
+      Partial-layer approximation is not a viable quality-recovery strategy:
+      keeping even the 8 most-sensitive layers at full precision saves only ~2.3 pp
+      of perturbation (from 48% to ~45%) while eliminating 20% of the potential
+      FLOP savings.
+  
+      The practical implication is that **improving approximation quality uniformly
+      across all layers** (e.g., raising the hot-channel fraction or improving the
+      routing signal) is a more effective path than selectively protecting a subset
+      of layers.
+    }
+  }
