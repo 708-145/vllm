@@ -8,6 +8,123 @@ Do the same for the up projection: Compute low precision for cold channels and f
 
 Down projection is different since the hot/cold channels correspond to inputs. Compute the full matrix in low precision. Then add a sparse high precision correction for hot input channels. Needs invention how to implement this efficiently! 
 
+## Evaluation metrics
+
+### Limitation of output cosine similarity
+
+All experiments report **output cosine similarity** between `out_full` and
+`out_hybrid` in the MLP output (residual-stream) space.  This is a convenient,
+fast metric but has three systematic weaknesses:
+
+1. **Magnitude-blind.**  Cosine similarity is 1.0 for `out_hybrid = 2 × out_full`
+   — a perfect score despite doubling the residual contribution.  Ternary gate
+   approximations change the output norm non-trivially and this is invisible.
+
+2. **Not tied to logits.**  The residual stream is projected onto the vocabulary
+   via `W_U = lm_head.weight` (shape `[vocab, H]`).  Two hidden vectors can be
+   close in cosine distance yet produce very different top-token predictions,
+   depending on where they fall relative to the rows of `W_U`.  A cosine gap of
+   0.015 may be negligible in one direction and catastrophic in another.
+
+3. **Mean masks tail events.**  Perplexity is a geometric mean of per-token NLL;
+   one severely wrong token dominates.  A high mean cosine similarity hides
+   occasional tokens where the approximation produces a completely wrong output.
+
+### Cosine similarity
+
+Used as the primary metric throughout exp1–11.  Cheap and layer-agnostic, but
+only measures angle in hidden space — see limitations above.
+
+### Perplexity proxy
+
+#### Full logit-space KL divergence
+
+The most direct proxy for perplexity increase.  Given the MLP output error
+`δh = out_hybrid − out_full`, compute the change in logit space using a
+first-order approximation that skips LayerNorm (valid for small δh):
+
+```python
+lf = out_full   @ W_U.T          # (T, vocab)
+lh = out_hybrid @ W_U.T          # (T, vocab)
+pf = torch.softmax(lf, dim=-1)
+ph = torch.softmax(lh, dim=-1)
+kl = (pf * (pf / (ph + 1e-9)).log()).sum(-1).mean()   # KL(full || hybrid)
+```
+
+`W_U` is `model.lm_head.weight`; for tied-embedding models use
+`model.model.embed_tokens.weight`.  The GEMM `(T, H) @ (H, vocab)` is
+expensive for large vocabularies — subsample to ~500 tokens or use bfloat16
+to keep it tractable in the per-layer loop.
+
+#### W_U-weighted L2 error
+
+Weights the hidden-space error by how much each direction actually moves
+logits, using the singular spectrum of `W_U` (one-time offline SVD):
+
+```python
+# Offline (once per model):
+U_emb, S_emb, _ = torch.linalg.svd(W_U, full_matrices=False)  # (H, rank), (rank,)
+
+# Per token batch:
+err_proj     = (out_hybrid - out_full) @ U_emb   # (T, rank)
+weighted_err = (err_proj * S_emb).norm(dim=-1).mean()
+```
+
+Strictly more informative than hidden-space cosine: it measures the magnitude
+of the error in the subspace that `W_U` amplifies most.
+
+### Top-1 preservation rate
+
+What fraction of tokens keep the same predicted top-1 token after the
+approximation?  The most interpretable single number for top-token prediction
+quality:
+
+```python
+top1_match = (lf.argmax(-1) == lh.argmax(-1)).float().mean()
+```
+
+Reuses the same `lf`/`lh` from the KL computation — no extra cost.
+
+### Practical helper for exp12+
+
+All metrics share the same `W_U` GEMM.  Recommended single helper:
+
+```python
+def logit_metrics(
+    out_full: torch.Tensor,   # (T, H)
+    out_hybrid: torch.Tensor, # (T, H)
+    W_U: torch.Tensor,        # (vocab, H)
+) -> tuple[float, float, float]:
+    """Returns (kl_div, top1_match, logit_cos)."""
+    lf = out_full   @ W_U.T
+    lh = out_hybrid @ W_U.T
+    pf = torch.softmax(lf.float(), dim=-1)
+    ph = torch.softmax(lh.float(), dim=-1)
+    kl         = float((pf * (pf / (ph + 1e-9)).log()).sum(-1).mean())
+    top1_match = float((lf.argmax(-1) == lh.argmax(-1)).float().mean())
+    cos        = float(F.cosine_similarity(lf, lh, dim=-1).mean())
+    return kl, top1_match, cos
+```
+
+`cos` here is cosine similarity in **logit space** — more meaningful than
+hidden-space cosine because it measures angle between the pre-softmax output
+distributions.
+
+### Metric comparison summary
+
+| Metric | Space | Ties to perplexity | Ties to top-1 | Cost |
+|--------|-------|--------------------|---------------|------|
+| Output cosine similarity | hidden | weak | weak | free |
+| Logit cosine similarity | logit | moderate | moderate | `W_U` GEMM |
+| KL divergence | probability | **direct** | moderate | `W_U` GEMM |
+| Top-1 preservation rate | token | moderate | **direct** | `W_U` GEMM |
+| `W_U`-weighted L2 error | logit (singular) | moderate | moderate | `W_U` SVD + GEMM |
+
+All four non-trivial metrics share the same `W_U` GEMM, so the marginal cost
+of adding all of them together is just one GEMM — compute all in a single pass
+over `lf` and `lh`.
+
+
 ## Experiment 1
 
 As proxy simply use the sign of each weight as low precision value.
@@ -929,4 +1046,267 @@ quality of exp4 while improving cold-channel SwiGLU accuracy via exact up values
     3. **Scale to lower hot fractions**: at 0.5% hot we already see 0.633 output
        cosine similarity — evaluate whether the FLOP savings at 1–5% hot are
        worth the quality cost in practice.
+  }
+
+  ## Experiment 11 {
+    ### Motivation
+
+    Experiment 10 (ternary gate α=0.75 + pre-SiLU `|gate_approx|` routing +
+    full-precision up) reached 0.476 output cosine similarity at 10% hot,
+    exceeding exp5's prior-token hotlist (0.310) and exp4's sign-gate routing
+    (0.245).  The question: can the routing signal be further improved by using
+    the **prior token's** gate activations as the hot-channel selector?
+
+    At decode time the hotlist from token t−1 is free: either the full-precision
+    gate `gate_full[t-1]` (computed anyway on the critical path) or the ternary
+    proxy `gate_approx[t-1]` (a byproduct of the ternary pass) can seed the
+    routing for token t.  This eliminates any online GEMM cost for routing.
+
+    Three routing variants are tested, all sharing the exp10 weight scheme
+    (ternary gate proxy α, full-precision up, full W_down):
+
+    | Variant | Routing signal | Inference cost |
+    |---|---|---|
+    | A — **current** | `\|gate_approx[t]\|` (exp10 baseline) | ternary GEMM on critical path |
+    | B — **proxy prior** | `\|gate_approx[t-1]\|` | free: reuse last step's ternary result |
+    | C — **oracle prior** | `\|gate_full[t-1]\|` | free: reuse last step's full gate |
+
+    Variant C is the oracle ceiling — it tells us whether the prior hotlist idea
+    itself is sound independent of proxy quality.  The proxy prior (B) is more
+    practical: it doesn't require storing an extra full-precision intermediate.
+
+    ### Scheme
+
+      1. `T_gate = T(W_gate, τ)`, τ = α × mean(|W_gate|)
+      2. `gate_approx[t] = T_gate @ x[t]`       ternary gate, current token
+      3. `up_full[t]     = W_up @ x[t]`          full-precision up, current token
+      4. Routing signal from prior token (variant-dependent)
+      5. `hot = top-F channels by routing signal`
+      6. `gate_hybrid[hot]  = W_gate[hot] @ x[t]`  full-prec gate for hot
+         `gate_hybrid[cold] = gate_approx[t][cold]` ternary for cold
+      7. `swiglu = SiLU(gate_hybrid) * up_full[t]`
+      8. `out    = W_down @ swiglu`
+
+    Sweeps: α ∈ {0.0 (sign), 0.75}; hot fractions ∈ {0.5%, 1%, 2%, 5%, 10%, 20%, 30%}.
+    Adjacent-token pairs: prior=0..T−2, current=1..T−1 (T=2 000 cap).
+
+    ### Results (granite-4.2-3b, 40 layers, 2 000 tokens/layer, MPS)
+
+    #### Output cosine similarity — α=0.75 (best from exp10)
+
+    | hot% | current (exp10) | proxy prior | oracle prior |
+    |---|---|---|---|
+    | 0.5% | 0.633 | **0.675** | 0.669 |
+    | 1% | 0.612 | **0.665** | 0.657 |
+    | 2% | 0.586 | **0.654** | 0.643 |
+    | 5% | 0.536 | **0.630** | 0.616 |
+    | **10%** | 0.476 | **0.600** | 0.585 |
+    | 20% | 0.386 | **0.552** | 0.538 |
+    | 30% | 0.314 | **0.511** | 0.497 |
+
+    #### Output cosine similarity — α=0.0 (sign baseline)
+
+    | hot% | current | proxy prior | oracle prior |
+    |---|---|---|---|
+    | 0.5% | 0.551 | **0.593** | 0.588 |
+    | 1% | 0.529 | **0.583** | 0.576 |
+    | 2% | 0.503 | **0.571** | 0.562 |
+    | 5% | 0.454 | **0.549** | 0.536 |
+    | **10%** | 0.398 | **0.522** | 0.506 |
+    | 20% | 0.316 | **0.479** | 0.462 |
+    | 30% | 0.251 | **0.443** | 0.425 |
+
+    #### Comparison across all experiments (10% hot, best config)
+
+    | Experiment | Routing signal | Out cos-sim @10% |
+    |---|---|---|
+    | Exp 7 (sign gate + sign up) | post-SiLU `\|SwiGLU_approx\|` | 0.065 |
+    | Exp 8 (ternary gate + ternary up) | post-SiLU `\|SwiGLU_approx\|` | 0.093 |
+    | Exp 9 (ternary gate + full up) | post-SiLU `\|SwiGLU_approx\|` | 0.181 |
+    | Exp 4 (sign gate, pre-SiLU) | `\|gate_approx[t]\|` | 0.245 |
+    | Exp 5 (prior-token hotlist) | `\|gate_full[t-1]\|` (oracle) | 0.310 |
+    | Exp 10 (ternary gate + full up) | `\|gate_approx[t]\|` pre-SiLU | 0.476 |
+    | **Exp 11 (ternary gate + full up)** | **`\|gate_approx[t-1]\|` proxy prior** | **0.600** |
+    | Exp 11 ceiling (ternary gate + full up) | `\|gate_full[t-1]\|` oracle prior | 0.585 |
+
+    ### Key findings
+
+    **Proxy prior outperforms oracle prior at every hot fraction.**  Using
+    `|gate_approx[t-1]|` (ternary) beats `|gate_full[t-1]|` (exact) by
+    0.010–0.020 consistently.  This is a surprising inversion: the less accurate
+    signal routes better.  The likely explanation is that `gate_approx` smooths
+    out single-token transients in the full gate — channels that briefly spike
+    in `gate_full` but are not persistently hot are not promoted.  The ternary
+    proxy has implicit temporal low-pass filtering from its threshold, which
+    improves stability as a one-step-ahead predictor.
+
+    **Prior routing gives a large, uniform gain over current-token routing.**
+    At 10% hot, proxy prior (0.600) vs current (0.476): +0.124 improvement
+    across all 40 layers.  The gain is larger in deeper layers (layers 28–39
+    average Δ≈+0.155) than shallow layers (0–9 average Δ≈+0.100), suggesting
+    that the later layers' activations are more temporally correlated.
+
+    **0.600 output cosine similarity at 10% hot** with a routing signal that
+    is already available from the previous step — no routing GEMM overhead on
+    the critical path.  This is nearly double exp5's 0.310 (which also used a
+    prior hotlist but with sign-gate cold channels and sign W_down correction).
+
+    **Exp5 vs exp11 gap explained entirely by the weight scheme.**  Exp5 used
+    oracle prior routing (`|gate_full[t-1]|`) and achieved 0.310.  Exp11 with
+    oracle prior achieves 0.585 — a 1.9× improvement from the same routing
+    oracle.  The difference is pure weight scheme: ternary gate + full up vs
+    sign gate + sign up + residual W_down correction.
+
+    **Monotonically decreasing, no U-shape** across all α values and variants —
+    the full-precision up continues to guarantee well-behaved routing.
+
+    **α=0.75 remains optimal** (46% gate zeros) with proxy prior; the ternary
+    threshold sparsity is equally beneficial regardless of the routing variant.
+
+    ### Conclusion
+
+    Combining the ternary gate proxy (α=0.75) + full-precision up from exp10
+    with prior-token routing yields **0.600 output cosine similarity at 10%
+    hot channels** — with **zero routing overhead** on the critical path.
+
+    The unexpected finding that the proxy prior beats the oracle prior reveals
+    that the ternary proxy acts as a temporal filter: it suppresses transient
+    spikes and routes based on channels that are persistently large, which is
+    exactly what is needed for a one-step-ahead predictor.
+
+    Next directions:
+
+    1. **Why does proxy prior beat oracle prior?** Quantify the temporal
+       autocorrelation of `|gate_approx|` vs `|gate_full|`; measure the
+       fraction of "transient" channels (hot at t but cold at t+1) that the
+       proxy correctly ignores.
+    2. **Two-step lookahead**: use `|gate_approx[t-1]|` to also reduce the hot
+       gate recompute budget — can we run the ternary pass only on non-hotlist
+       channels and skip even the full hot-gate recompute for channels stable in
+       the prior list?
+    3. **Ternary down proxy**: cold channel contributions to the down projection
+       use full W_down — would a ternary W_down for cold channels yield further
+       savings without hurting quality?
+  }
+
+  ## Experiment 12 {
+    ### Motivation
+
+    Experiments 10–11 use full-precision W_down for all I intermediate channels.
+    The down projection (H × I = 2560 × 8192) is the costliest GEMM in the MLP
+    block.  At 10% hot, only 10% of the input columns carry high-quality SwiGLU
+    values; the remaining 90% (cold) are small due to the ternary gate
+    approximation.  The hypothesis: cold columns' W_down contribution is
+    dominated by sign rather than magnitude, so replacing W_down[:, cold] with
+    T(W_down, τ_d) should recover most quality at lower compute cost.
+
+    ### Scheme
+
+    Anchored on exp11's best config (α_gate=0.75, proxy-prior routing):
+
+      1. `gate_approx[t]  = T(W_gate, τ_g) @ x[t]`          ternary gate
+      2. `up_full[t]      = W_up @ x[t]`                     full-precision up
+      3. `hot = top-F by |gate_approx[t-1]|`                 proxy-prior routing
+      4. `gate_hybrid     = W_gate[hot] @ x[t]  ⊕  gate_approx[t][cold]`
+      5. `swiglu          = SiLU(gate_hybrid) * up_full[t]`
+      6. `out = W_down[:, hot] @ swiglu[hot] + T(W_down, τ_d)[:, cold] @ swiglu[cold]`
+
+    Three output schemes compared:
+    - **ternary_cold**: exact W_down for hot, T(W_down, τ_d) for cold
+    - **full_down**: exact W_down for all (exp11 baseline)
+    - **ternary_all**: T(W_down, τ_d) for all channels (no hot/cold split)
+
+    α_down ∈ {0.0, 0.25, 0.50, 0.75, 1.00, 1.50};
+    hot fractions ∈ {0.5%, 1%, 2%, 5%, 10%, 20%, 30%}.
+
+    ### Results (granite-4.2-3b, 40 layers, 2 000 tokens/layer, MPS)
+
+    #### W_down proxy zero-fraction
+
+    | α_down | zero% of W_down |
+    |---|---|
+    | 0.00 | 0% |
+    | 0.25 | 16% |
+    | 0.50 | 32% |
+    | **0.75** | **46%** |
+    | 1.00 | 58% |
+    | 1.50 | 77% |
+
+    #### Output cosine similarity — ternary_cold (exp12 scheme)
+
+    | α_down | zero% | 0.5% | 1% | 2% | 5% | **10%** | 20% | 30% |
+    |---|---|---|---|---|---|---|---|---|
+    | 0.00 | 0% | 0.517 | 0.510 | 0.502 | 0.485 | 0.462 | 0.425 | 0.392 |
+    | 0.25 | 16% | 0.554 | 0.547 | 0.538 | 0.520 | 0.495 | 0.455 | 0.420 |
+    | 0.50 | 32% | 0.576 | 0.569 | 0.560 | 0.540 | 0.515 | 0.474 | 0.437 |
+    | **0.75** | **46%** | **0.582** | **0.575** | **0.566** | **0.546** | **0.521** | **0.480** | **0.442** |
+    | 1.00 | 58% | 0.573 | 0.566 | 0.557 | 0.538 | 0.514 | 0.473 | 0.436 |
+    | 1.50 | 77% | 0.519 | 0.512 | 0.504 | 0.487 | 0.465 | 0.428 | 0.395 |
+
+    #### Quality cost vs exp11 full_down baseline (Δ at 10% hot)
+
+    | α_down | Δ(ternary_cold − full_down) @10% |
+    |---|---|
+    | 0.00 | −0.138 |
+    | 0.25 | −0.105 |
+    | 0.50 | −0.085 |
+    | **0.75** | **−0.079** |
+    | 1.00 | −0.086 |
+    | 1.50 | −0.135 |
+
+    #### Hot/cold split value: Δ(ternary_cold − ternary_all) at 10% hot
+
+    | α_down | Δ |
+    |---|---|
+    | 0.00 | −0.003 |
+    | 0.75 | −0.003 |
+    | 1.50 | −0.003 |
+
+    ### Key findings
+
+    **Full_down always wins — ternary down unconditionally hurts.** At every hot
+    fraction and every α_down, `full_down` (exp11 baseline) is the best scheme
+    by a large and consistent margin.  The best ternary_cold result at 10% hot
+    is 0.521 (α_down=0.75) vs 0.600 with full_down — a **−0.079 deficit** even
+    at the optimal sparsity.  At sign-only (α_down=0) the deficit is −0.138.
+
+    **The hot/cold split for W_down is nearly worthless.** Δ(ternary_cold −
+    ternary_all) is only −0.003 at 10% hot and −0.008 at 30% hot across all
+    α_down values.  Keeping exact W_down for hot channels adds essentially
+    nothing over approximating all channels equally.  This means the hot/cold
+    distinction that is powerful for the gate projection is irrelevant for the
+    down projection.
+
+    **W_down ternary quality doesn't scale the same way as W_gate.** The sweet
+    spot is still α_down=0.75 (46% zeros, same pattern as W_gate) but the
+    *magnitude* of loss is much higher: −0.079 for down vs the −0.010 overhead
+    from ternary gate in exp10.  W_down columns for cold channels carry more
+    signal than the gate rows for cold channels — the cold SwiGLU values are not
+    as small as initially expected after the ternary gate + full up pipeline.
+
+    **The cause**: cold SwiGLU entries are *not* near-zero. Even with a ternary
+    gate approximation for cold channels, `up_full` is exact, so
+    `SiLU(gate_approx_cold) * up_full_cold` can be substantial when `up_full`
+    is large.  The full W_down is therefore needed to correctly weight these
+    contributions.
+
+    ### Conclusion
+
+    Ternary W_down for cold channels is **not viable** — it costs 0.079 output
+    cosine similarity at 10% hot with no compensating benefit, and the hot/cold
+    split for W_down adds nothing (−0.003).  Full-precision W_down must be
+    retained for all channels.
+
+    The cause is that `up_full` is exact: even cold SwiGLU entries can be
+    non-trivial, and approximating their W_down contribution introduces errors
+    proportional to `|up_full_cold|` rather than the near-zero values assumed.
+
+    **Implication for the overall scheme**: the FLOP saving target for the down
+    projection must come from *sparsity in the SwiGLU vector* (zeroing out cold
+    contributions entirely) rather than weight approximation.  This points
+    toward a different direction: approximate cold SwiGLU as exactly zero and
+    compute `out ≈ W_down[:, hot] @ swiglu[hot]` — a true sparse GEMM that
+    skips cold columns altogether.  The quality cost of this zeroing is exp11's
+    result (0.600 at 10% hot) minus what a true sparse down GEMM would achieve,
+    which is a separate question from weight approximation.
   }
