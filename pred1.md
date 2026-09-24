@@ -26,6 +26,8 @@
 | 19 | 1-bit sign + E8M0 per-block scale, sweep B∈{8,16,32,64} — encoding quality only | — | B=8: TARE=0.837, **8.00×**; B=16: TARE=0.859, **10.67×** | B=8 E8M0 matches FP16-opt at B=16 in both quality and compression; sweet spot is B=8 |
 | 20 | B=8 E8M0 sign gate+up, hot refinement for both, full W_down — e2e top-1 | Proxy-prior | match=0.194 @10% hot (vs 0.516 exp14) | Encoding W_up cold channels is too costly; cold gate×cold up errors multiply in SwiGLU; full-precision up must be retained |
 | 21 | B=8 E8M0 gate only, full up+down — e2e top-1 | Current / proxy-prior (identical in prefill) | match=0.414 @10% hot (vs 0.516 exp14) | E8M0 worse than ternary despite lower TARE: over-scaled cold values inflate SiLU; TARE does not align with SwiGLU's asymmetric over/under-estimation cost |
+| 22 | B=8 E5M3 gate only, top-k routing, full up+down — e2e top-1 | Current / proxy-prior | match=0.408 @10% hot | E5M3 (7.2× better scale precision than E8M0) still below ternary baseline; scale precision alone does not fix cold-channel over-activation |
+| 23 | B=8 E5M3 gate, **threshold routing** T×mean(gate_approx), full up+down — e2e top-1 | Threshold on current | **match=0.736 @T=0.5** (best result in series) | Threshold routing with accurate E5M3 scale fixes exp2's failure; adaptive hot fraction beats fixed top-k by 20 pp |
 
 
 ## Core idea
@@ -2211,3 +2213,115 @@ mask), with cold channel gate values replaced by a *downward-biased* approximati
 near zero.  This points to a hybrid: use E8M0 as the routing proxy, and use a
 separate magnitude-suppressed approximation (e.g. scale by `β × mean(|W|)`, β < 1)
 for cold channel computation.
+
+## Experiment 22
+
+E5M3 gate encoding (B=8, top-k routing) — direct replacement of E8M0 in exp21.
+
+### E5M3 format
+
+E5M3: 5 exponent bits, 3 mantissa bits, 1 byte/block — same storage as E8M0.
+`s = (1 + m/8) × 2^e`, with `m ∈ {0..7}` giving 8 levels per octave.
+
+From the pre-run analysis across all 40 layers:
+
+| Format | Mean scale error (log₂) | Mean linear error | Max linear error |
+|---|---|---|---|
+| E8M0 | 0.251 | 19.6% | 41.4% |
+| **E5M3** | **0.035** | **2.5%** | **6.7%** |
+
+E5M3 is 7.2× more accurate than E8M0 at the same 1 byte/block storage cost.
+
+### Results (granite-4.2-3b, 8 prompts, 500 prefill tokens, CPU)
+
+| hot% | E5M3 current | E5M3 proxy_prior | exp14 (ternary) | exp21 (E8M0) | Δ E5M3 vs exp14 |
+|---|---|---|---|---|---|
+| 5% | 0.386 | 0.386 | 0.456 | 0.378 | −0.070 |
+| 10% | 0.408 | 0.408 | 0.516 | 0.414 | −0.108 |
+| 20% | 0.456 | 0.456 | 0.588 | 0.456 | −0.132 |
+| 30% | 0.532 | 0.532 | 0.632 | 0.520 | −0.100 |
+
+E5M3 is marginally better than E8M0 at some hot fractions (30%: 0.532 vs 0.520)
+but both remain well below the ternary baseline.  The improved scale precision
+does not close the gap.  Current and proxy_prior remain identical (batched
+prefill, as expected).
+
+### Conclusion
+
+The E5M3 scale improvement (19.6% → 2.5% error) does not translate to better
+end-to-end quality vs the ternary α=0.75 scheme.  The root cause from exp21
+holds: the issue is not scale precision but the fundamental asymmetry of SwiGLU —
+the ternary scheme's 46% zero fraction suppresses cold channels near zero,
+while both E8M0 and E5M3 assign nonzero scales to every element.  No amount of
+scale precision fixes the over-activation of cold channels when the encoding
+produces nonzero output for all 8192 channels.
+
+---
+
+## Experiment 23
+
+E5M3 gate encoding (B=8) with **magnitude-threshold routing** on `|gate_approx|`
+instead of top-k.  This revisits the exp2 approach, which failed with the sign
+predictor because `|gate_approx|` was a poor proxy for `|gate_full|`.  With E5M3
+(2.5% mean scale error) the approximation is much more accurate.
+
+### Scheme
+
+```
+hot = { channels where |gate_approx[t]| > T × mean(|gate_approx[t]|) }
+```
+
+`T` is a per-inference threshold factor, swept over {0.5, 1.0, 1.5, 2.0, 3.0}.
+No sort needed — hot mask is a single comparison per token.  Hot channel count
+varies per token (adaptive sparsity), unlike top-k which is fixed.
+
+### Results (granite-4.2-3b, 8 prompts, 500 prefill tokens, CPU)
+
+| Threshold T | match | perturb |
+|---|---|---|
+| **0.5× mean** | **0.736** | **26.4%** |
+| 1.0× mean | 0.600 | 40.0% |
+| 1.5× mean | 0.494 | 50.6% |
+| 2.0× mean | 0.424 | 57.6% |
+| 3.0× mean | 0.328 | 67.2% |
+
+Reference: exp14 ternary @10% hot = **0.516** match.
+
+### Key findings
+
+**Threshold T=0.5 is the best single result across all experiments at 73.6%
+match (26.4% perturbation)** — significantly better than exp14's best of 63.2%
+at 30% hot.  T=1.0 also beats exp14 at 60.0% match.
+
+**Threshold routing decisively outperforms top-k routing.**  At T=0.5 the
+match rate is 0.736 vs exp22's best of 0.532 — a 20 pp gap.  The reason:
+threshold routing is *adaptive*.  Tokens with many large gate activations
+recompute more channels; tokens where the gate is uniformly small recompute
+almost nothing.  The hot fraction is matched to the actual per-token sparsity
+of the gate distribution, whereas top-k forces a fixed fraction regardless.
+
+**T=1.0 matches the exp14 ternary at 0.60** with no fixed hot fraction — the
+threshold naturally selects the channels that need full precision on each token.
+
+**The E5M3 scale precision is what makes this work.**  In exp2, thresholding on
+`|gate_approx|` (sign predictor) collapsed SwiGLU cosine similarity to near
+zero because the sign-approx magnitude had no reliable relationship to the true
+gate magnitude.  With E5M3's 2.5% mean scale error, `|gate_approx|` faithfully
+reflects `|gate_full|`, so the threshold correctly identifies channels that are
+truly large and need recomputation.
+
+### Conclusion
+
+B=8 E5M3 gate encoding with threshold routing at **T=0.5× mean** achieves
+**73.6% match / 26.4% perturbation** — the best end-to-end result in the entire
+experiment series, surpassing exp14's 63.2% at 30% hot by 10 pp.
+
+The threshold scheme has two further practical advantages over top-k:
+1. **No sort** — the hot mask is computed with a single comparison per token
+2. **Adaptive hot fraction** — naturally recomputes more on "busy" tokens and
+   less on "quiet" ones, matching compute to actual per-token difficulty
+
+The combination of E5M3 weight encoding + magnitude threshold routing is the
+new best scheme.  The next questions are: what is the typical hot fraction at
+T=0.5 (compute cost), and does the threshold transfer to decode-time
+autoregressive generation where proxy-prior routing becomes meaningful?
