@@ -28,6 +28,10 @@
 | 21 | B=8 E8M0 gate only, full up+down — e2e top-1 | Current / proxy-prior (identical in prefill) | match=0.414 @10% hot (vs 0.516 exp14) | E8M0 worse than ternary despite lower TARE: over-scaled cold values inflate SiLU; TARE does not align with SwiGLU's asymmetric over/under-estimation cost |
 | 22 | B=8 E5M3 gate only, top-k routing, full up+down — e2e top-1 | Current / proxy-prior | match=0.408 @10% hot | E5M3 (7.2× better scale precision than E8M0) still below ternary baseline; scale precision alone does not fix cold-channel over-activation |
 | 23 | B=8 E5M3 gate, **threshold routing** T×mean(gate_approx), full up+down — e2e top-1 | Threshold on current | **match=0.736 @T=0.5** (best result in series) | Threshold routing with accurate E5M3 scale fixes exp2's failure; adaptive hot fraction beats fixed top-k by 20 pp |
+| 24 | E5M3 threshold fine sweep T=0.20–0.80 (step 0.05), per-layer hot% monitoring, 2% floor variant | Threshold on current | **match=0.818 @T=0.20**, 88% hot | Monotonic improvement as T decreases; no dead layers; floor unnecessary; curve still rising at T=0.20 |
+| 26 | Sparse SwiGLU: E5M3 routing, hot channels full-precision gate+up, cold channels zeroed (no approx value used), full W_down — e2e top-1 | Threshold on current | match=0.814 @T=0.20, 88% hot | Consistently −0.004 to −0.059 vs exp24; cold gate_approx contribution (SiLU≈0) is slightly helpful, not harmful; zeroing cold channels is not an improvement |
+| 27 | Low-rank SVD routing (union top-k gate+up), hot full-precision gate+up, cold E5M3 B=8 gate+up, full W_down — e2e top-1 | Top-k union on \|gate_lr\|∪\|up_lr\| | rank=1024: **0.834 @50% hot**, 0.612 @20%; rank=256: 0.764 @50%; rank=64: 0.392–0.678 | Low-rank routing + E5M3 cold for both gate+up beats exp24 at equal hot% for rank≥256 @50%; at 20% hot exp24 (0.818) still wins; cold E5M3 up tolerable when routing quality is high |
+| 28 | E5M3-encoded SVD factor matrices (binary sign+scale), rank=1024 and 2048, same hybrid scheme as exp27 — e2e top-1 | Top-k union on encoded \|gate_lr\|∪\|up_lr\| | rank=2048: 0.808 @50%, 0.582 @20%; rank=1024: 0.766 @50% | Encoding SVD factors costs ~3–7 pp vs full-prec factors (exp27); rank=2048 partly recovers loss but still −2.6 pp vs exp27 r1024 @50%; routing cost at r=2048 = 105% of full GEMM (no net saving); E5M3 encoding of orthonormal vectors loses too much directional info |
 
 
 ## Core idea
@@ -2325,3 +2329,82 @@ The combination of E5M3 weight encoding + magnitude threshold routing is the
 new best scheme.  The next questions are: what is the typical hot fraction at
 T=0.5 (compute cost), and does the threshold transfer to decode-time
 autoregressive generation where proxy-prior routing becomes meaningful?
+
+## Experiment 24
+
+Fine-grained threshold sweep T ∈ {0.20, 0.25, …, 0.80} for the B=8 E5M3
+gate encoding, with per-layer hot-fraction monitoring and a 2% floor variant.
+
+### Scheme
+
+```
+hot = { |gate_approx[t]| > T × mean(|gate_approx[t]|) }          (pure)
+hot = above ∪ top-2% channels by |gate_approx[t]|                  (floored)
+```
+
+### Results (granite-4.2-3b, 8 prompts, 500 prefill tokens, CPU)
+
+| T | match | perturb | mean hot% | Δ floored |
+|---|---|---|---|---|
+| **0.20** | **0.818** | **18.2%** | 88.0% | +0.000 |
+| 0.25 | 0.798 | 20.2% | 85.0% | +0.000 |
+| 0.30 | 0.798 | 20.2% | 82.0% | +0.000 |
+| 0.35 | 0.782 | 21.8% | 79.1% | +0.000 |
+| 0.40 | 0.768 | 23.2% | 76.1% | +0.000 |
+| 0.45 | 0.740 | 26.0% | 73.2% | +0.000 |
+| 0.50 | 0.736 | 26.4% | 70.3% | +0.000 |
+| 0.55 | 0.724 | 27.6% | 67.4% | +0.000 |
+| 0.60 | 0.684 | 31.6% | 64.5% | +0.000 |
+| 0.65 | 0.688 | 31.2% | 61.7% | +0.000 |
+| 0.70 | 0.664 | 33.6% | 58.9% | +0.000 |
+| 0.75 | 0.636 | 36.4% | 56.1% | +0.000 |
+| 0.80 | 0.622 | 37.8% | 53.4% | — |
+
+References: exp23 T=0.50 match=0.736 · exp14 ternary @30% match=0.632
+
+### Key findings
+
+**T=0.20 is the new best at match=0.818 (18.2% perturbation)** — beating
+exp23's T=0.50 (0.736) by 8.2 pp and exp14's best (0.632) by 18.6 pp.  Match
+improves monotonically as T decreases from 0.80 to 0.20, with no plateau
+visible yet — the optimal threshold may be below 0.20.
+
+**The floor makes no difference at any tested threshold.**  Pure and floored
+results are identical throughout.  At T=0.20 the mean hot fraction is already
+88%, so the 2% floor is never the binding constraint.  Even at T=0.80 (53%
+hot), all layers have well above 2% active channels — there are no dead layers
+in this model for any tested threshold.
+
+**Hot fraction is high across the board.**  At T=0.20, 88% of channels are
+being recomputed — the scheme is converging toward full precision, which
+explains the high match rate.  The useful operating range is where the
+quality-cost curve is steep.  Between T=0.20 (88% hot, 18.2% perturb) and
+T=0.50 (70% hot, 26.4% perturb) we pay 18 pp more perturbation to save 18 pp
+of hot channels.
+
+**The quality–compute curve is roughly linear in this range** with no sharp
+knee visible.  There is a small non-monotonicity at T=0.60/0.65 (0.684 vs
+0.688) suggesting per-sample variance at this sample size (n=500 tokens).
+
+### Conclusion
+
+The optimal threshold in the tested range is T=0.20 with match=0.818.  The
+sweep suggests the optimum may be even lower (T < 0.20), but at T=0.20 already
+88% of channels are recomputed — approaching full precision at high compute cost.
+The threshold routing scheme has no dead-layer problem; the 2% floor is
+unnecessary for this model.
+
+The trade-off picture across key operating points:
+
+| T | hot% | match | perturb | interpretation |
+|---|---|---|---|---|
+| 0.20 | 88% | **0.818** | 18.2% | near-full precision, best quality |
+| 0.30 | 82% | 0.798 | 20.2% | similar quality, 6pp cheaper |
+| 0.50 | 70% | 0.736 | 26.4% | exp23 baseline |
+| 0.65 | 62% | 0.688 | 31.2% | comparable to exp14 ternary @30% |
+| exp14 ternary | ~52% hot FLOP | 0.632 | 36.8% | ternary gate baseline |
+
+The next experiment should extend the sweep below T=0.20 to find whether there
+is a true optimum or whether the curve keeps improving all the way to T→0
+(which would be equivalent to full precision computation with an encoding
+overhead, not a useful approximation).
