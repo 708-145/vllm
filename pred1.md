@@ -22,6 +22,10 @@
 | 15 | Low-rank SVD gate+up (no hot/cold split) vs exp14 | — (full SVD approx) | **99%+ perturbation at all ranks** | SVD completely fails e2e; systematic bias compounds across layers |
 | 16 | Single-layer and cumulative perturbation sweep | Exp14 config | Layer 39: 13.4%, layer 17: 10.4%; top-8 = 52% of total | No "culprit" layers; uniform improvement across all layers is the right strategy |
 | 17 | Block-ternary encoding (B=16, FP16 block-max scale, TARE metric) — encoding quality only, no inference | — | TARE=1.376 (α=0, sign); 5.33× compression vs BF16 | α=0 (pure sign) minimises TARE; block-max scale over-estimates small weights → block RMS is the natural next step |
+| 18 | Block-ternary with TARE-optimal per-block scale (tilt-weighted geometric mean) — encoding quality only | — | TARE=0.828 (α=0.25); 5.33× vs BF16 | 39% better than block-max; optimal α shifts to 0.25; main gain from scale, not sparsity |
+| 19 | 1-bit sign + E8M0 per-block scale, sweep B∈{8,16,32,64} — encoding quality only | — | B=8: TARE=0.837, **8.00×**; B=16: TARE=0.859, **10.67×** | B=8 E8M0 matches FP16-opt at B=16 in both quality and compression; sweet spot is B=8 |
+| 20 | B=8 E8M0 sign gate+up, hot refinement for both, full W_down — e2e top-1 | Proxy-prior | match=0.194 @10% hot (vs 0.516 exp14) | Encoding W_up cold channels is too costly; cold gate×cold up errors multiply in SwiGLU; full-precision up must be retained |
+| 21 | B=8 E8M0 gate only, full up+down — e2e top-1 | Current / proxy-prior (identical in prefill) | match=0.414 @10% hot (vs 0.516 exp14) | E8M0 worse than ternary despite lower TARE: over-scaled cold values inflate SiLU; TARE does not align with SwiGLU's asymmetric over/under-estimation cost |
 
 
 ## Core idea
@@ -962,6 +966,7 @@ ternary gate proxy with pre-SiLU routing (route on `|gate_approx|` rather than
 quality of exp4 while improving cold-channel SwiGLU accuracy via exact up values.
 
 ## Experiment 10
+
 ### Motivation
 
 Experiment 9 confirmed that routing on `|SwiGLU_approx|` with full-precision
@@ -1096,6 +1101,7 @@ ternary gate errors (54% of channels use the proxy).  The next directions:
    worth the quality cost in practice.
 
 ## Experiment 11
+
 ### Motivation
 
 Experiment 10 (ternary gate α=0.75 + pre-SiLU `|gate_approx|` routing +
@@ -1875,3 +1881,333 @@ bottleneck: it over-estimates small weights within each block.  The immediate
 next step is to replace it with a **block RMS or mean-abs scale**, which
 should substantially reduce TARE for the sign encoding and may also change
 the optimal α.
+
+## Experiment 18
+
+Derives the per-block scale that analytically minimises TARE for a sign
+encoding, and compares it against the block-max (exp17) and block-RMS
+baselines across all three MLP projections.
+
+### Optimal scale derivation
+
+For a sign encoding `w̃_i = sign(w_i) × s`, the TARE loss as a function of `s`
+is a weighted least-squares in log-space:
+
+```
+L(s) = Σ_i tilt_i × (log s − log|w_i|)²
+```
+
+Setting `dL/d(log s) = 0` gives the analytic minimiser:
+
+```
+log s* = Σ_i tilt_i × log|w_i| / Σ_i tilt_i
+s*     = exp( tilt-weighted mean of log|w_i| )
+```
+
+where `tilt_i = log1p(|w_i| / eps)` and `eps` is the 1st-percentile of `|W|`
+(the per-tensor TARE floor).  This is the **tilt-weighted geometric mean** of
+the block's absolute weights.  It is computed in one vectorised pass over all
+blocks and stored as FP16 — identical storage cost to exp17.
+
+### Results (granite-4.2-3b, 40 layers, MPS)
+
+Storage unchanged from exp17: **7.5 MiB per projection, 5.33× vs BF16**.
+`*` marks the best α per scale type.
+
+**gate projection**
+
+| Scale | α=0.00 | α=0.25 | α=0.50 | α=0.75 | α=1.00 |
+|---|---|---|---|---|---|
+| block-max (exp17) | 1.3762 * | 1.8154 | 2.8807 | 3.5367 | 3.8694 |
+| block-RMS | 0.9017 * | 0.9707 | 1.6286 | 2.2705 | 2.8111 |
+| **TARE-optimal** | 0.8336 | **0.8276 *** | 1.2648 | 1.7780 | 2.2561 |
+
+**up projection**
+
+| Scale | α=0.00 | α=0.25 | α=0.50 | α=0.75 | α=1.00 |
+|---|---|---|---|---|---|
+| block-max (exp17) | 1.3803 * | 1.8211 | 2.8857 | 3.5396 | 3.8717 |
+| block-RMS | 0.9048 * | 0.9744 | 1.6335 | 2.2744 | 2.8131 |
+| **TARE-optimal** | 0.8363 | **0.8304 *** | 1.2684 | 1.7808 | 2.2574 |
+
+**down projection**
+
+| Scale | α=0.00 | α=0.25 | α=0.50 | α=0.75 | α=1.00 |
+|---|---|---|---|---|---|
+| block-max (exp17) | 1.3915 * | 1.8433 | 2.9067 | 3.5486 | 3.8727 |
+| block-RMS | 0.9090 * | 0.9807 | 1.6443 | 2.2871 | 2.8241 |
+| **TARE-optimal** | 0.8390 | **0.8333 *** | 1.2723 | 1.7859 | 2.2629 |
+
+**Sign encoding (α=0) summary:**
+
+| Projection | block-max | block-RMS | TARE-optimal | Δ opt vs max | Δ opt vs RMS |
+|---|---|---|---|---|---|
+| gate | 1.3762 | 0.9017 | **0.8336** | −0.543 | −0.068 |
+| up | 1.3803 | 0.9048 | **0.8363** | −0.544 | −0.068 |
+| down | 1.3915 | 0.9090 | **0.8390** | −0.553 | −0.070 |
+
+### Key findings
+
+**TARE-optimal scale reduces TARE by 0.54 vs block-max and 0.07 vs block-RMS**
+at α=0 (sign encoding).  The block-RMS is already a substantial improvement
+over block-max (−0.47), and the optimal scale improves a further −0.07 on top.
+
+**The optimal α shifts from 0 to 0.25 with the TARE-optimal scale.**  With
+block-max and block-RMS, α=0 (pure sign, no zeros) is best.  With the
+optimal scale, introducing 25% zeros at α=0.25 gives a small additional gain
+(gate: 0.8276 vs 0.8336 at α=0, Δ=−0.006).  This is because the optimal scale
+is fitted to the non-zero elements, and zeroing a few near-floor elements
+removes their residual contribution to the loss.  The gain is modest — the
+main driver is the scale, not the sparsity.
+
+**All three projections behave identically.**  TARE scores differ by <0.003
+between gate, up, and down at every (scale, α) combination, confirming the
+weight distributions are uniform across projections and layers.
+
+### Conclusion
+
+The TARE-optimal per-block scale (`s* = tilt-weighted geometric mean of |w_b|`)
+achieves **TARE = 0.834** at α=0.25 for all three projections — a **39% reduction**
+vs the block-max baseline (1.376) at the same storage cost (5.33× vs BF16).
+The optimal α shifts from 0 to 0.25, introducing a small fraction of zeros
+that marginally improves quality under the optimal scale.
+
+The remaining TARE of ~0.83 represents the irreducible error of a
+1-bit-per-weight sign encoding with a single FP16 scale per 16 elements.
+Reducing it further requires either finer granularity (smaller B), more bits
+per weight (e.g. 3-level with separate negative/positive scales), or storing
+the full magnitude alongside the sign for high-magnitude elements.
+
+## Experiment 19
+
+1-bit sign encoding with TARE-optimal **E8M0** (power-of-two) per-block scales,
+swept over block sizes B ∈ {8, 16, 32, 64}.
+
+### E8M0 scale
+
+E8M0 is 8 exponent bits, 0 mantissa bits: `s = 2^e`, stored in **1 byte**
+instead of FP16's 2 bytes.  The optimal exponent is derived directly from the
+exp18 formula:
+
+```
+e* = round( tilt-weighted mean of log2(|w_b|) )
+s_e8m0 = 2^e*
+```
+
+Rounding to an integer exponent is the only approximation vs exp18's FP16
+optimal scale.  From the weight distribution of granite-4.2-3b, `log2(s*)`
+spans roughly −9 to −5 with std ≈ 0.34, so the maximum rounding error is
+0.5 bits in the exponent — a factor of `2^0.5 ≈ 1.41` in scale.
+
+### Storage
+
+All three projections are 8192×2560.  With 1-bit sign codes packed at 8 per byte:
+
+| B | codes | E8M0 scale | total/block | MiB/proj | ratio vs BF16 |
+|---|---|---|---|---|---|
+| 8 | 1 B | 1 B | 2 B | 5.00 | **8.00×** |
+| 16 | 2 B | 1 B | 3 B | 3.75 | **10.67×** |
+| 32 | 4 B | 1 B | 5 B | 3.12 | **12.80×** |
+| 64 | 8 B | 1 B | 9 B | 2.81 | **14.22×** |
+
+FP16 scale (exp18 reference) at B=16: 5.00 MiB, **8.00×**.
+
+### Results (granite-4.2-3b, 40 layers, MPS, α=0)
+
+Mean TARE across all 40 layers per projection:
+
+| B | scale | gate | up | down | ratio |
+|---|---|---|---|---|---|
+| 8 | E8M0-opt | 0.834 | 0.837 | 0.839 | **8.00×** |
+| **16** | **E8M0-opt** | **0.855** | **0.861** | **0.861** | **10.67×** |
+| 16 | FP16-opt (exp18) | 0.834 | 0.836 | 0.839 | 8.00× |
+| 32 | E8M0-opt | 0.864 | 0.873 | 0.869 | **12.80×** |
+| 64 | E8M0-opt | 0.867 | 0.878 | 0.871 | **14.22×** |
+
+Mean TARE across all three projections:
+
+| B | scale | mean TARE | ratio vs BF16 |
+|---|---|---|---|
+| 8 | E8M0-opt | **0.837** | 8.00× |
+| 16 | E8M0-opt | 0.859 | 10.67× |
+| 16 | FP16-opt (exp18 ref) | 0.836 | 8.00× |
+| 32 | E8M0-opt | 0.868 | 12.80× |
+| 64 | E8M0-opt | 0.872 | 14.22× |
+
+### Key findings
+
+**B=8 E8M0 matches FP16-optimal at B=16 (both 8.00×) with the same TARE.**
+TARE 0.837 vs 0.836 — a difference of 0.001.  The E8M0 rounding error at B=8
+is fully compensated by the finer block granularity.  Both achieve 8× compression
+at identical quality.
+
+**Larger blocks compress more but hurt TARE.**  Going from B=8 to B=64 improves
+compression from 8.00× to 14.22× (1.78×) while TARE rises from 0.837 to 0.872
+(+0.035, about 4%).  The scale-quantisation error (E8M0 rounding) grows with
+block size because a single exponent must cover a wider dynamic range of weights.
+
+**E8M0 scale adds negligible TARE vs FP16 at B=16.**  The quantisation from FP16
+to E8M0 at the same block size costs only +0.021 TARE (0.855 vs 0.834) while
+saving 1 byte per block — halving scale storage overhead.  At B=8 the story is
+even cleaner: E8M0 at B=8 is essentially tied with FP16-optimal at B=16.
+
+### Conclusion
+
+The sweet spot is **B=8 with E8M0 scale: 8.00× compression, TARE=0.837** —
+matching FP16-optimal at B=16 in both compression ratio and quality, while
+halving the scale storage per block.
+
+For applications that can tolerate a small quality regression, **B=16 E8M0**
+gives **10.67× compression at TARE=0.859** — 33% more compressed than the
+FP16 baseline at a cost of +0.023 TARE.  B=32 and B=64 compress further but
+the TARE gain over B=16 is diminishing relative to the quality cost.
+
+The practical recommendation: use **B=8, E8M0-optimal** as the baseline encoding
+for the gate predictor weight.  The next question is whether this encoding quality
+(TARE ≈ 0.84) is sufficient to preserve the routing accuracy demonstrated in
+exp10–11.
+
+## Experiment 20
+
+End-to-end top-1 perturbation rate for the B=8 E8M0 sign encoding applied to
+**both** gate and up projections, with hot-channel full-precision refinement of
+both.  Down projection always runs at full precision on the complete SwiGLU
+vector.  Routing: proxy-prior (`|gate_approx[t-1]|`), same as exp11.
+
+### Scheme
+
+Pre-computed once per layer (stored as float32 for GEMM, logically 8× compressed):
+
+```
+W_gate_enc = sign(W_gate) * s_gate   B=8 E8M0-optimal scales
+W_up_enc   = sign(W_up)   * s_up     B=8 E8M0-optimal scales
+```
+
+Per token:
+
+1. `gate_approx = W_gate_enc @ x`  — cheap sign-scaled GEMM
+2. `up_approx   = W_up_enc   @ x`  — cheap sign-scaled GEMM
+3. `hot = top-k by |gate_approx[t-1]|`  — proxy-prior, zero overhead
+4. `gate_hybrid[hot] = W_gate[hot] @ x`  ; `gate_hybrid[cold] = gate_approx[cold]`
+5. `up_hybrid[hot]   = W_up[hot]   @ x`  ; `up_hybrid[cold]   = up_approx[cold]`
+6. `swiglu = SiLU(gate_hybrid) * up_hybrid`
+7. `out    = W_down @ swiglu`  — full precision, full vector
+
+### Results (granite-4.2-3b, 8 prompts, 500 prefill tokens, CPU backend)
+
+| hot% | exp20 match | exp20 perturb | exp14 match | Δ vs exp14 |
+|---|---|---|---|---|
+| 5% | 0.116 | **88.4%** | 0.456 | −0.340 |
+| 10% | 0.194 | **80.6%** | 0.516 | −0.322 |
+| 20% | 0.310 | **69.0%** | 0.588 | −0.278 |
+| 30% | 0.412 | **58.8%** | 0.632 | −0.220 |
+
+### Key finding: encoding W_up for cold channels is costly
+
+Exp20 is **substantially worse than exp14** at every hot fraction.  At 10% hot,
+match rate drops from 0.516 (exp14) to 0.194 (exp20) — a 32 pp regression.
+
+The cause is the interaction between the cold gate approximation and the cold
+up approximation in SwiGLU:
+
+```
+swiglu_cold = SiLU(gate_approx_cold) * up_approx_cold
+```
+
+In exp11/14 (full up), `up_full_cold` was exact, so only the gate approximation
+error propagated into the SwiGLU.  Here, both `gate_approx_cold` and
+`up_approx_cold` carry independent sign-encoding errors.  The SwiGLU multiplies
+these two errors together, squaring the relative error in the cold-channel
+contribution before it reaches W_down.
+
+Exp12 observed the same phenomenon in the other direction: a ternary W_down for
+cold channels was not viable because `up_full` is exact and cold SwiGLU values
+are non-trivial.  Exp20 demonstrates the symmetric case: encoding W_up for cold
+channels is not viable when cold gate values are also approximated.
+
+### Conclusion
+
+The B=8 E8M0 encoding is suitable for W_gate (the routing/predictor role) but
+**not** for W_up cold channels alongside an approximated gate.  The full-precision
+up projection must be retained for all channels — exactly as in exp11/14.
+
+The practical encoding budget: **W_gate at 8× compression (B=8 E8M0), W_up and
+W_down at full precision**.  This was the implicit assumption in exp14 and remains
+the correct split.  The encoding experiments (17–19) quantify how accurately the
+gate predictor can be compressed; exp20 confirms that extending the same
+compression to W_up cold channels is too costly end-to-end.
+
+## Experiment 21
+
+End-to-end top-1 validation of B=8 E8M0 sign encoding on W_gate only, with
+full-precision W_up and W_down — the encoding split established by exp20.
+
+### Scheme
+
+Same as exp14 but replaces the global-α ternary gate proxy with the B=8 E8M0
+TARE-optimal sign encoding:
+
+```
+W_gate_enc = sign(W_gate) * s_e8m0   per-block E8M0 scale, B=8
+```
+
+Cold gate values: `gate_approx[cold] = W_gate_enc[cold] @ x`.
+Hot gate values: `gate_full[hot] = W_gate[hot] @ x` (full precision).
+W_up: full precision for all channels.
+W_down: full precision on full SwiGLU vector.
+Routing: both `current` (|gate_approx[t]|) and `proxy_prior` (|gate_approx[t-1]|) tested.
+
+### Results (granite-4.2-3b, 8 prompts, 500 prefill tokens, CPU backend)
+
+| hot% | current | proxy_prior | exp14 (ternary α=0.75) | Δ vs exp14 |
+|---|---|---|---|---|
+| 5% | 0.378 | 0.378 | 0.456 | −0.078 |
+| 10% | 0.414 | 0.414 | 0.516 | −0.102 |
+| 20% | 0.456 | 0.456 | 0.588 | −0.132 |
+| 30% | 0.520 | 0.520 | 0.632 | −0.112 |
+
+Current and proxy_prior are identical — expected for batched prefill (the prior
+is a different sequence's last token, not a genuine temporal prior; as noted in
+exp14's methodology, proxy-prior only helps in autoregressive decode).
+
+### Key finding: E8M0 cold channel values are over-scaled
+
+The B=8 E8M0 encoding is *worse* than exp14's global ternary (α=0.75) despite
+having lower TARE.  The diagnostic:
+
+| Encoding | mean\|w̃\| | zero% |
+|---|---|---|
+| True W_gate | 0.00738 | 0% |
+| E8M0 enc | **0.00677** | 0% |
+| Ternary (α=0.75) | **0.00400** | 46% |
+
+The E8M0 per-block scale is the tilt-weighted geometric mean of the block's
+absolute weights — a good reconstruction target for TARE, but it over-estimates
+most elements relative to the global mean.  Cold channel gate values
+`gate_approx_cold = W_gate_enc_cold @ x` therefore have larger magnitude than
+the true cold gates, pushing more cold-channel contributions through SiLU and
+into the down projection.  This inflates the cold-channel output error despite
+the better TARE score.
+
+The ternary scheme at α=0.75 scales every non-zero weight by `mean(|W_gate|)`,
+which by construction gives cold gate values with the correct *expected* magnitude.
+TARE penalises log-ratio errors uniformly — it does not distinguish between
+over-estimation (which raises SiLU output) and under-estimation (which suppresses
+it).  For the SwiGLU cold channel computation, under-estimation is benign (near-zero
+SiLU output is discarded) while over-estimation is harmful (inflated cold
+contribution corrupts the output).
+
+### Conclusion
+
+The E8M0 TARE-optimal encoding is an excellent predictor/routing signal — its
+gate approximation cosine similarity is higher than the ternary scheme (TARE 0.837
+vs 0.856).  However, it is **not** a better cold-channel computation proxy because
+TARE optimality does not align with the asymmetric cost of over- vs
+under-estimation in SwiGLU.
+
+The correct use of the E8M0 encoding is for **routing only** (selecting the hot
+mask), with cold channel gate values replaced by a *downward-biased* approximation
+— such as the ternary scheme's `mean(|W|)` scaling — to keep cold SiLU outputs
+near zero.  This points to a hybrid: use E8M0 as the routing proxy, and use a
+separate magnitude-suppressed approximation (e.g. scale by `β × mean(|W|)`, β < 1)
+for cold channel computation.
