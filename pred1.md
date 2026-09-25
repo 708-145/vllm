@@ -53,6 +53,9 @@
 | 41 | MXFP6-E2M3 with E8M0 vs E5M3 block scale — controlled isolation of scale format, B=32, no routing | E8M0 (OCP power-of-two) vs E5M3 (TARE-optimal fine-grained), element format fixed to E2M3 | E8M0: gate_only=1.6%/0.0% thermal, all=4.2%/0.8%; **E5M3: gate_only=28.2%/18.2% thermal, all=99.0%/98.2%** | E8M0 is confirmed as the culprit: same E2M3 elements with E5M3 scale collapse from 4.2% to 99% perturbation on all-matrix encoding. The E5M3 TARE scale is accurate (geomean-aligned) but not power-of-two — the FP6 grid misaligns with the weight exponent field, producing large quantisation errors for most weights. E8M0's exact power-of-two alignment is the essential property of OCP MX, not the number of scale mantissa bits. |
 | 42 | 3bpw 2-level ±{s_lo,s_hi} with E8M0 scales vs E5M3 scales — B=16, TARE EM, no routing | E8M0 (power-of-two centroids, this exp) vs E5M3 centroids (exp38 ref) | E8M0: gate_only=49%/42.6% thermal, all=98.8%/97.8%; E5M3: gate_only=51%/46.2%, all=99.8%/99.2% | Unlike MXFP6, switching 3bpw to E8M0 scales gives only marginal improvement (~2 pp). Both variants are catastrophically bad. The 3bpw scheme has no explicit per-weight exponent field — weights are just ±s_lo or ±s_hi — so the power-of-two alignment benefit of E8M0 provides almost no gain. The 3bpw scheme is fundamentally limited by having only 2 magnitude levels per block, not by scale format. MXFP6-E2M3 (32 levels) with E8M0 remains the clear winner at similar storage cost. |
 | 43 | MXFP4-E2M1 (OCP, 4.25bpw) and hypothetical MXFP5-E2M2 (5.25bpw) — B=32, E8M0, no routing, all 4 matrix combinations; MXFP6-E2M3 inline for reference | E2M1 (8 codes, fp_max=6); E2M2 (16 codes, fp_max=7); E2M3 (32 codes, fp_max=7.5) | MXFP4 all: strict=17.2%, **thermal@0.7=8.6%**; MXFP5 all: strict=9.6%, thermal@0.7=3.6%; MXFP6 all: strict=4.2%, thermal@0.7=0.8% | MXFP4 lands in NVFP4 territory (17.2% strict all-matrix). Each mantissa bit halves the perturbation: MXFP4→5 saves ~8 pp strict, MXFP5→6 saves ~5 pp. MXFP5 thermal@0.7 on all-matrix (3.6%) is already FP8-equivalent — the extra mantissa bit over MXFP4 pushes it across the FP8 threshold. MXFP6 strictly better than MXFP5 at same exponent width. The E2Mx family shows clean monotone improvement with mantissa bits at E8M0 B=32. |
+| 44 | E5M0 vs E8M0 block scale + scale distribution — MXFP4/5/6-E2Mx, B=32 | E8M0 (range 2^±127) vs E5M0 (range 2^±15); element formats unchanged; plus full scale exponent histogram | **Δ = 0.0 pp everywhere**; scales span only e∈[−12, −3], 10 distinct values; 66% of blocks use e∈{−8,−7}; 4 bits would cover the full observed range | E8M0 range entirely unused. All 78.6M blocks have e∈[−12, −3]. Distribution is bimodal: e=−8 (32.5%) and e=−7 (33.6%) account for 66% of all blocks; e∈[−10,−7] covers 99.3%. A 4-bit scale (16 values) or even E4M0 would be sufficient for this model. |
+| 44b | LUT-based mixed-mode scale scheme: bit-cost analysis — no new inference; analytical follow-on to exp44 | Scale distribution from exp44; 3 modes: ≤2 scales→1 bit/block, 3–4 scales→2 bits/block, ≥5 scales→4 bits/block; 2-bit per-channel mode flag | **1.461 bits/block** actual overhead (1.266 index + 0.194 LUT amortisation); mode-0: 76.6% of channels, mode-1: 22.9%, mode-2: 0.4%; MXFP6-E2M3 total = **6.046 bpw** vs 6.250 flat | E8M0 scale overhead reduced 5.5× (8.00 → 1.46 bits/block), saving 0.204 bpw. Mode-2's 16-entry LUT is over-provisioned — 2 bits (4 entries) covers 99.6% of channels. User estimate of ~1.2 bits/block was close; actual 1.46 driven by 23% mode-1 channels (2 bits/block each). |
+| 44c | LUT scheme applied to MXFP5-E2M2 and MXFP4-E2M1 — analytical extension; no new inference | Same LUT channel assignment (format-independent); only element bpw changes: MXFP4=4 bits/weight, MXFP5=5, MXFP6=6; scale overhead = 1.461/32 = **0.04566 bpw** in all cases | MXFP4+LUT: **4.046 bpw** (saving 0.204 bpw / 4.8%); MXFP5+LUT: **5.046 bpw** (3.9%); MXFP6+LUT: **6.046 bpw** (3.3%). Quality unchanged: LUT is lossless scale re-encoding. MLP total: MXFP5+LUT=1.59 GB, MXFP4+LUT=1.27 GB vs BF16 5.03 GB | Absolute scale saving (0.204 bpw) is identical across all E2Mx formats — it is purely a scale-field reduction. MXFP5+LUT (5.046 bpw, thermal@0.7=3.6%) is the practical sweet spot: FP8-equivalent quality at 3.17× BF16 compression. MXFP4+LUT buys another 0.77 GB at the cost of crossing back above the FP8 thermal threshold. |
 
 
 ## Core idea
@@ -4551,3 +4554,268 @@ NVFP4 territory (8.6% thermal). MXFP5 is the minimum-bpw format that achieves
 FP8-equivalent thermal quality at 5.25 bpw. MXFP6-E2M3 at 6.25 bpw is the
 practical operating point with clear headroom. MXFP8-E4M3 offers negligible
 further improvement over MXFP6 for static weight encoding.
+
+
+## Experiment 44 — E5M0 vs E8M0 block scale: does the range matter?
+
+**Question:** The OCP MX spec mandates an 8-bit E8M0 scale (range 2^±127).
+Is that range actually needed, or would a narrower 5-bit E5M0 scale
+(range 2^±15, analogous to the FP16 exponent) suffice?
+
+**Setup:** MXFP4-E2M1, MXFP5-E2M2, MXFP6-E2M3 with B=32, same 4 matrix
+combinations.  Two scale variants:
+- **E8M0**: `e = ceil(log2(block_max / fp_max))`, clamped to [−127, 127]
+- **E5M0**: same rule, clamped to [−15, 15] (5-bit, 3 bytes saved per 8 blocks)
+
+### Diagnostic: blocks requiring |e| > 15
+
+Before running inference, checked all 78,643,200 blocks across all layers and
+all three projection matrices:
+
+```
+MXFP4-E2M1: 0/78,643,200 blocks clipped (0.000%)
+MXFP5-E2M2: 0/78,643,200 blocks clipped (0.000%)
+MXFP6-E2M3: 0/78,643,200 blocks clipped (0.000%)
+```
+
+**Zero blocks require a scale outside [2^−15, 2^15].** Granite-4.2-3b weights
+are entirely within this range.
+
+### Results
+
+E5M0 and E8M0 produce **bit-identical encoded matrices** for every layer,
+projection, and format. The inference results are identical to four decimal
+places across all 48 (format × condition × metric) combinations. Δ = 0.0 pp
+everywhere.
+
+### Analysis
+
+The result follows directly from the diagnostic: since no block has
+`block_max / fp_max` outside [2^−15, 2^15], the E8M0 and E5M0 clamp never
+differs. The two scale functions return the same value for every block.
+
+The E8M0 range [2^−127, 2^127] was designed for generality across all possible
+weight distributions, including activations, gradients, and models with
+significant outliers. For the MLP weights of Granite-4.2-3b (a compact 3B
+parameter model with standard initialisation and training), weights are
+well-behaved and the scale exponent stays comfortably within [−15, 15].
+
+**Implication for storage:** the 3 extra bits of E8M0 vs E5M0 cost
+3 bits per 32-weight block. For MXFP6-E2M3 at B=32:
+- E8M0: (32×6 + 8) / 32 = 6.25 bpw
+- E5M0: (32×6 + 5) / 32 = **6.156 bpw** — saving 0.094 bpw (~1.5%)
+
+For MXFP4-E2M1: 4.25 → **4.156 bpw**. A small but free saving on this model.
+
+**Caveat:** this is model-specific. Larger models, models with weight outliers
+(e.g. from long training runs, RLHF, or certain architectures), or activation
+quantisation would likely require the full E8M0 range. The OCP MX spec uses
+E8M0 for universal compatibility. E5M0 is only safe after verifying the
+distribution, as done here.
+
+### Conclusion
+
+The extended range of E8M0 is entirely unused for Granite-4.2-3b MLP weights.
+E5M0 (5-bit, ±15 exponent range) produces identical results at 0.094 bpw
+lower storage cost per format. The 3 extra E8M0 bits are OCP overhead for
+worst-case generality, not required for this model.
+
+### Scale exponent distribution (MXFP6-E2M3, fp_max=7.5, B=32)
+
+Measured across all 78,643,200 blocks (40 layers × 3 matrices):
+
+| Exponent e | Scale 2^e | Count | % | Cumulative% |
+|---|---|---|---|---|
+| −12 | 0.000244 | 454 | 0.001% | 0.001% |
+| −11 | 0.000488 | 196,795 | 0.250% | 0.251% |
+| **−10** | **0.000977** | **13,663,109** | **17.4%** | 17.6% |
+| **−9** | **0.001953** | **12,464,990** | **15.9%** | 33.5% |
+| **−8** | **0.003906** | **25,532,526** | **32.5%** | 65.9% |
+| **−7** | **0.007812** | **26,421,869** | **33.6%** | 99.5% |
+| −6 | 0.015625 | 350,215 | 0.4% | 100.0% |
+| −5 | 0.031250 | 12,196 | 0.016% | ≈100% |
+| −4 | 0.062500 | 982 | 0.001% | ≈100% |
+| −3 | 0.125000 | 64 | 0.000% | 100.0% |
+
+**Summary:**
+- Range used: e ∈ [−12, −3] — only **10 distinct exponent values** out of E8M0's 255
+- Central mass: e ∈ [−10, −7] covers **99.3%** of all blocks
+- Bimodal peak: e=−8 (32.5%) and e=−7 (33.6%) together = **66.1%**
+- Mean exponent: **−8.17** (scale ≈ 0.0035, consistent with typical BF16 weight magnitude ~0.01–0.03)
+- MXFP4 (fp_max=6.0) covers the same [−12, −3] range with a shifted peak at e=−7 (53.1%)
+
+### Minimum viable scale width for this model
+
+The observed range [−12, −3] spans 10 values — 4 bits suffice:
+
+| Scale format | Bits | Range | Covers [−12,−3]? | bpw overhead (B=32) | MXFP6-E2M3 total |
+|---|---|---|---|---|---|
+| E8M0 (OCP) | 8 | [−127, 127] | ✓ (with massive headroom) | 0.250 | 6.250 |
+| E5M0 | 5 | [−15, 15] | ✓ | 0.156 | 6.156 |
+| **E4M0** | **4** | **[−7, 8]** | **✓ with offset** | **0.125** | **6.125** |
+
+An E4M0 scale with bias 12 (byte values 0..9 for e=−12..−3) fits in 4 bits.
+The practical bpw saving over E8M0 is 0.125 bpw (~2%), but the circuit
+complexity saving in hardware is meaningful: a 4-bit vs 8-bit scale multiplier.
+
+
+### Channel-level scale range analysis (mixed-mode motivation)
+
+Two questions relevant to a mixed-mode encoding design:
+
+**1. What fraction of channels have all their blocks within a narrow range?**
+
+A channel here = one output row of a weight matrix (= 80 consecutive B=32
+blocks for gate/up [I=2560 inputs ÷ 32], or 256 blocks for down [I=8192]).
+
+| Scale range | % blocks in range | % channels with ALL blocks in range |
+|---|---|---|
+| e ∈ [−10, −7] (4 values) | **99.29%** | **84.16%** |
+| e ∈ [−9, −7]  (3 values) | 81.91% | 72.34% |
+| e ∈ [−8, −7]  (2 values) | 66.06% | 66.73% |
+
+**84% of all output channels have every single one of their blocks within
+[−10, −7].** For these channels a 2-bit scale offset (4 values) relative to a
+channel-level base exponent would suffice — no per-block E8M0 byte needed.
+
+Per-projection detail for e ∈ [−10, −7]:
+
+| Projection | Total channels | All-in (≤4 values) | % |
+|---|---|---|---|
+| gate | 327,680 | 291,580 | **89.0%** |
+| up | 327,680 | 256,673 | **78.3%** |
+| down | 102,400 | 89,468 | **87.4%** |
+
+**2. How much do block scales vary *within* a single channel?**
+
+Span = max(e) − min(e) across all blocks in one channel:
+
+| Span (octaves) | Count | % | Cumulative% |
+|---|---|---|---|
+| 0 (all blocks same scale) | 37 | 0.00% | 0.00% |
+| **1** | **580,544** | **76.6%** | 76.6% |
+| **2** | **158,720** | **21.0%** | 97.6% |
+| 3 | 14,982 | 2.0% | 99.5% |
+| 4 | 3,083 | 0.4% | 99.9% |
+| 5–6 | 394 | 0.05% | 100% |
+
+**97.6% of all channels have a within-channel scale span of ≤2 octaves.**
+The vast majority span exactly 1 octave (two adjacent powers of two).
+
+### Implications for mixed-mode encoding
+
+The data suggests a practical two-tier scheme:
+
+```
+Tier A (84% of channels — "narrow"):
+  Channel base exponent  e_base  (1 byte, shared for whole channel)
+  Per-block 2-bit delta  d ∈ {−1, 0, +1, +2}  →  scale = 2^(e_base + d)
+  Block storage: 2 bits scale + 6 bits element = 8 bits/weight at MXFP6
+  vs current MXFP6: 8 bits scale / 80 blocks = 0.1 bits overhead/weight
+  New overhead: 8 bits base / (80×32 weights) + 2 bits/weight ≈ 2.003 bpw scale overhead
+  → Actually worse: inline 2-bit delta per block beats channel-shared base only
+     if many blocks share the same delta.
+
+Simpler framing: the 84% narrow-channel result means that for 84% of channels,
+a single 3-bit or 4-bit channel-level scale (replacing 80 independent E8M0 bytes)
+would be lossless. Saving: 80 bytes − 1 byte = 79 bytes per channel, or
+79/(80×32) ≈ 0.031 bytes/weight = 0.25 bits/weight overhead reduction.
+At MXFP6-E2M3 this brings the effective bpw from 6.25 → ~6.04 for 84% of channels.
+
+The more interesting mixed-mode application is **element-format mixing**:
+channels confirmed to stay within 2 scale values could encode their weights
+more aggressively (e.g. MXFP4 with a guaranteed 1-octave range), while outlier
+channels (16%) keep MXFP6 or BF16. This is the direction to explore next.
+```
+
+### LUT-based mixed-mode scale scheme: bit cost analysis
+
+**Scheme definition** (proposed by user):
+
+| Mode | Condition | Index bits/block | LUT entries | LUT size |
+|---|---|---|---|---|
+| 0 | ≤2 distinct scales in channel | 1 bit | 2 × E8M0 | 2 bytes |
+| 1 | 3–4 distinct scales | 2 bits | 4 × E8M0 (pad if <4) | 4 bytes |
+| 2 | ≥5 distinct scales | 4 bits | 16 × E8M0 (pad if <16) | 16 bytes |
+
+A 2-bit mode flag per channel selects which mode applies (cost ≈ 0.0001 bpw, negligible).
+
+**Channel/block assignment across all 757,760 channels, 78,643,200 blocks:**
+
+| Mode | Channels | % | Blocks | Index bits |
+|---|---|---|---|---|
+| 0 (1 bit/block) | 580,581 | **76.6%** | 58,675,664 | 58,675,664 |
+| 1 (2 bits/block) | 173,830 | **22.9%** | 19,482,608 | 38,965,216 |
+| 2 (4 bits/block) | 3,349 | **0.4%** | 484,928 | 1,939,712 |
+
+**Scale overhead computation (per block, averaged across all blocks):**
+
+```
+LUT bits:    (580,581×2×8 + 173,830×4×8 + 3,349×16×8) / 78,643,200
+           = 15,280,528 / 78,643,200  =  0.194 bits/block
+
+Index bits:  (58,675,664×1 + 19,482,608×2 + 484,928×4) / 78,643,200
+           = 99,580,592 / 78,643,200  =  1.266 bits/block
+
+Total:       1.266 + 0.194 = 1.461 bits/block
+```
+
+**Your estimate of ~1.2 bits/block was close but slightly optimistic.** The actual figure is **1.46 bits/block**, driven mainly by the index bits from the 22.9% of mode-1 channels (2 bits/block). The LUT overhead is only 0.19 bits/block — very small as expected.
+
+The gap from 1.2 to 1.46 comes from mode-1: 23% of channels need 2 index bits, not 1, which adds 0.23 bits/block above a pure mode-0 world. If only mode-0 existed (all channels ≤2 scales), it would be `1×76.6% + 2×0.194 = 1.07 bits/block`. Mode-1 and mode-2 together push it to 1.46.
+
+**Summary vs flat E8M0:**
+
+| Scheme | Scale overhead bits/block | Total bpw (MXFP6-E2M3) | Saving vs E8M0 |
+|---|---|---|---|
+| Flat E8M0 B=32 (current) | 8.00 | 6.250 | — |
+| LUT 3-mode scheme | **1.46** | **6.046** | **0.204 bpw (3.3%)** |
+| Theoretical minimum (entropy) | ~0.8 | ~5.85 | upper bound |
+
+The LUT scheme reduces scale overhead from 8 bits/block to 1.46 bits/block — a **5.5× reduction** — for a net saving of **0.20 bpw** on MXFP6-E2M3.
+
+Note: the distinct-scale counts per channel are: n=1 (0.00%), n=2 (76.6%), n=3 (21.0%), n=4 (2.0%), n=5 (0.4%), n=6–7 (0.04%). There are no channels with more than 7 distinct scales, so mode-2's 16-entry LUT is over-provisioned — a 3-entry or 4-entry LUT with 2 index bits would suffice for 99.6% of channels. Capping mode-2 at 8 entries (3 index bits) instead of 16 would save a further ~0.004 bpw.
+
+### LUT scheme applied to MXFP5-E2M2 and MXFP4-E2M1
+
+The LUT channel assignment (mode-0/1/2 fractions) is **format-independent**: it is derived from the B=32 scale exponent distribution, which is the same regardless of whether the elements are 4-, 5-, or 6-bit. The only thing that changes between formats is the element contribution to bpw.
+
+**Derivation:**
+
+Scale overhead in bpw = 1.461 bits/block ÷ 32 weights/block = **0.04566 bpw** (identical for all E2Mx formats).
+
+| Format | Element bits/weight | Flat E8M0 bpw | LUT bpw | Saving vs flat | Relative saving |
+|---|---|---|---|---|---|
+| MXFP4-E2M1 | 4 | 4.250 | **4.046** | 0.204 bpw | **4.8%** |
+| MXFP5-E2M2 | 5 | 5.250 | **5.046** | 0.204 bpw | **3.9%** |
+| MXFP6-E2M3 | 6 | 6.250 | **6.046** | 0.204 bpw | **3.3%** |
+
+The absolute saving is **the same 0.204 bpw** across all three formats — it comes entirely from reducing the scale field from 8.00 to 1.461 bits/block, which is format-agnostic. The relative saving is largest for MXFP4 (4.8%) because the fixed 0.204 bpw scale saving is a larger fraction of total storage at 4 element bits.
+
+**Comparison across the full encoding spectrum:**
+
+| Format + scheme | Total bpw | Strict perturbation (all-matrix) | Thermal@0.7 |
+|---|---|---|---|
+| MXFP4-E2M1, flat E8M0 | 4.250 | 17.2% | 8.6% |
+| MXFP4-E2M1, LUT | **4.046** | 17.2% | 8.6% |
+| MXFP5-E2M2, flat E8M0 | 5.250 | 9.6% | 3.6% |
+| MXFP5-E2M2, LUT | **5.046** | 9.6% | 3.6% |
+| MXFP6-E2M3, flat E8M0 | 6.250 | 4.2% | 0.8% |
+| MXFP6-E2M3, LUT | **6.046** | 4.2% | 0.8% |
+
+Quality numbers are unchanged — the LUT scheme is a lossless scale re-encoding (same scale values, just indexed differently per channel).
+
+**Key observation:** MXFP5-E2M2 with LUT (**5.046 bpw**, thermal@0.7=3.6%) is FP8-equivalent and costs only 1.0 bpw more than MXFP4+LUT (4.046 bpw, thermal=8.6%). That 1.0 bpw buys a 5 pp reduction in strict perturbation and crosses the FP8 thermal threshold. The MXFP6+LUT–vs–MXFP5+LUT gap is 1.0 bpw for only a further 5.4 pp strict / 2.8 pp thermal improvement.
+
+**Practical storage summary (all-matrix, gate+up+down, granite-4.2-3b):**
+
+The total MLP weight budget is 40 layers × (2×8192×2560 + 8192×2560) weights = 2,516,582,400 weights = ~2.5B weights.
+
+| Scheme | bpw | Total MLP size | vs BF16 (5.0 GB) |
+|---|---|---|---|
+| BF16 (reference) | 16.0 | 5.03 GB | — |
+| MXFP6+LUT | 6.046 | 1.90 GB | **2.65× smaller** |
+| MXFP5+LUT | 5.046 | 1.59 GB | **3.17× smaller** |
+| MXFP4+LUT | 4.046 | 1.27 GB | **3.95× smaller** |
+
+**Conclusion:** The LUT scheme delivers the same 0.204 bpw saving regardless of element format. At MXFP4 this represents a 4.8% reduction (the largest relative gain), but MXFP4's 8.6% thermal perturbation means it sits firmly in NVFP4 territory regardless of scale encoding. MXFP5+LUT at 5.046 bpw is the practical sweet spot: FP8-equivalent thermal quality, 3.17× BF16 compression, and the LUT scheme squeezes an extra 200 MB out vs flat E8M0.
