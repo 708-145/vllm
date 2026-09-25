@@ -45,6 +45,7 @@
 | 33 | Sparse W_gate e2e top-1: unstructured keep=0.5 ± 300-step Adam ft, top-k routing, cold gate from sparse, up always full — e2e top-1 | Top-k on \|x @ W_sparse.T\|, cold gate = x @ W_sparse.T | kr=0.5+ft: **0.850 @20%, 0.862 @30%, 0.876 @50%**; kr=0.5 no-ft: 0.830/0.830/0.852 | New best across all hot fractions: +24 pp vs exp27 @20%, +16 pp @30%, +4 pp @50%; fine-tuning adds +2 pp; sparse W_gate doubles as routing signal and cold approximation, eliminating E5M3 encoding step entirely |
 | 34 | Thermal match rate for exp33 kr=0.5+ft and exp24 reference schemes — new metric | Thermal match (T=0.7/1.0, τ=ln2): forgive if gap < T·ln2 | sparse @20%: strict=15.0%, **thermal@0.7=5.6%, thermal@1.0=5.0%**; sparse @50%: strict=12.4%, **thermal@0.7=4.8%, thermal@1.0=3.6%** | Thermal metric reveals ~8–10 pp of strict perturbation is below the noise floor at T=0.7; exp33 @50% hot is effectively FP8-equivalent (3.6% thermal@1.0); exp24 E5M3 T=0.20 drops from 18.2% strict → 7.6% thermal@0.7; exp24 T=0.50 still 16% thermal — its errors are harder (large gap ~1.27 logits) |
 | 35 | Sparse up projection + zero-cold comparison; target regime 20–30% hot; strict + thermal metric | gate routing: top-k(\|x @ W_gate_sparse.T\|); cold gate = W_gate_sparse, cold up = W_up_sparse or zero; up always full for hot | sparse_gate+up @20%: strict=21.2%, **thermal@0.7=9.4%**; sparse_gate+up @30%: strict=18.4%, **thermal@0.7=8.6%**; zero_cold @20%: strict=76.8%, thermal=73.4% | Sparse up cold is worse than full-precision up (exp33): +7.8 pp strict at 20% hot; however thermal gap is narrower (+2.8 pp). Zero cold is catastrophically hard (gap 5.3 logits @20%): omitting cold channels is a hard error, not recoverable thermally. Sparse_gate_only @30% hot is the new sweet spot: strict=12.0%, thermal@0.7=5.6%, thermal@1.0=4.8% — FP8-equivalent at T=1.0 at the target hot fraction |
+| 36 | E5M3 B=8 cold up with sparse gate routing — e2e strict + thermal | cold gate = W_gate_sparse; cold up = E5M3 B=8 sign+scale; hot = full precision; down = full | @20% hot: strict=38.6%, **thermal@0.7=30.6%**; @30%: strict=30.0%, thermal@0.7=23.4%; @50%: strict=19.8%, thermal=10.8% | E5M3 cold up is far worse than full-precision up at sparse hot fractions (20–30%): +25 pp strict / +24 pp thermal at 20% hot; mean gap ~2.0 logits (hard errors). Only recovers at 50% hot (+6.6 pp strict, thermal@1.0=8.2%). W_up must stay full precision for cold channels regardless of up encoding scheme — confirming exp20 and exp35 at the cold-up encoding level |
 
 
 ## Core idea
@@ -3752,3 +3753,122 @@ load-bearing even for nominally "inactive" channels.
 - W_up: always full precision
 - W_down: always full precision
 - Cold gate: x @ W_sparse.T (free, reuses routing GEMM)
+
+---
+
+## Experiment 36 — E5M3 B=8 cold up with sparse gate routing
+
+### Motivation
+
+Exp35 established that W_up must stay full precision for cold channels.
+This experiment tests whether E5M3 B=8 encoding — the best compact encoding
+found in exp19 (TARE=0.837, 8× compression) — is good enough for cold up
+when routing quality is high (F1=0.902 from sparse gate, exp32).
+
+In exp27 E5M3 cold up was used successfully with SVD routing at 50% hot.
+The question is whether the higher routing quality of sparse W_gate makes
+E5M3 cold up viable at the target 20–30% hot regime.
+
+### Scheme
+
+```
+routing:   hot = top-k(|x @ W_gate_sparse.T|)   [kr=0.5+ft, from exp35 cache]
+cold gate: x @ W_gate_sparse.T                  [sparse approx, free]
+hot gate:  x @ W_gate_full.T                    [full precision]
+cold up:   x @ W_up_e5m3.T                      [E5M3 B=8 sign+scale]
+hot up:    x @ W_up_full.T                      [full precision]
+down:      swiglu @ W_down.T                    [always full precision]
+```
+
+W_up_e5m3 built once per layer: `sign(W_up) × s*` where `s*` is the
+tilt-weighted geometric mean of `|w_b|` per block of 8, quantised to E5M3
+(5-bit exponent + 3-bit mantissa, 1 byte/block). Build time: 6s for all 40 layers.
+
+Hot fractions swept: **20%, 25%, 30%, 50%**.
+
+### Results (granite-4.2-3b, 500 prefill tokens)
+
+#### Full results
+
+| Scheme | Strict% | Thermal @T=0.7 | Thermal @T=1.0 | Mean gap |
+|---|---|---|---|---|
+| sparse_gate+e5m3_up @20% | 38.6% | 30.6% | 27.0% | 2.005 logits |
+| sparse_gate_only @20% | **13.4%** | **6.6%** | **5.6%** | 1.062 logits |
+| sparse_gate+e5m3_up @25% | 34.4% | 24.6% | 20.6% | 1.610 logits |
+| sparse_gate_only @25% | **12.6%** | **5.6%** | **4.6%** | 1.048 logits |
+| sparse_gate+e5m3_up @30% | 30.0% | 23.4% | 19.2% | 1.584 logits |
+| sparse_gate_only @30% | **12.0%** | **5.6%** | **4.8%** | 1.081 logits |
+| sparse_gate+e5m3_up @50% | 19.8% | 10.8% | 8.2% | 1.064 logits |
+| sparse_gate_only @50% | **13.2%** | **5.4%** | **4.4%** | 0.833 logits |
+| exp24 E5M3 T=0.20 (~88% hot) | 18.2% | 7.6% | 4.8% | 0.661 logits |
+
+#### E5M3 up penalty vs full precision up
+
+| hot% | Δ strict | Δ thermal@0.7 | Δ thermal@1.0 | Δ mean gap |
+|---|---|---|---|---|
+| 20% | +25.2 pp | +24.0 pp | +21.4 pp | +0.943 logits |
+| 25% | +21.8 pp | +19.0 pp | +16.0 pp | +0.562 logits |
+| 30% | +18.0 pp | +17.8 pp | +14.4 pp | +0.503 logits |
+| 50% | +6.6 pp | +5.4 pp | +3.8 pp | +0.231 logits |
+
+### Key findings
+
+**E5M3 cold up fails badly at 20–30% hot.** At 20% hot, E5M3 cold up adds
++25.2 pp strict and +24.0 pp thermal@0.7 compared to full-precision cold up.
+The mean logit gap of 2.0 logits (vs 1.06 for full-precision up) confirms
+these are **hard errors** — not the soft near-ties seen with sparse gate cold.
+At T=0.7, 30.6% thermal perturbation is solidly in the NVFP4 range — far
+from the FP8-equivalent 5.6% achieved by keeping up full precision.
+
+**The penalty shrinks with more hot channels but never disappears.**
+At 50% hot, E5M3 up adds only +6.6 pp strict (19.8% vs 13.2%) and +5.4 pp
+thermal@0.7. Still +0.23 logit harder errors. Even at 50% hot, E5M3 cold up
+is worse than sparse_gate_only at 20% hot — cold up encoding hurts
+regardless of how few cold channels remain.
+
+**Why E5M3 cold up fails while E5M3 cold gate succeeded.**  The asymmetry is
+structural in SwiGLU:
+
+```
+SwiGLU(i) = SiLU(gate(i)) × up(i)
+```
+
+- **Cold gate error**: `gate_cold = gate_full + ε_gate`.  Since cold channels
+  are routed cold *because* `|gate_full(i)|` is small, `SiLU(gate_cold)` is
+  already near zero.  The SiLU suppresses both the signal and the error — the
+  error in the down projection contribution is `SiLU(gate_cold + ε) × up_full`,
+  and for small gate values `SiLU` is nearly linear with small slope, so `ε_gate`
+  matters little.
+
+- **Cold up error**: `up_cold = up_full + ε_up`.  The up error is **not
+  suppressed** by SiLU — it appears as `SiLU(gate_cold) × ε_up`.  Even though
+  `SiLU(gate_cold) ≈ 0` for the coldest channels, the channels at the cold/hot
+  boundary have gate values large enough to carry meaningful signal, and their
+  `ε_up` propagates directly.  With 70–80% of channels cold, there are many
+  such boundary channels summing into the down projection.
+
+**Comparison with exp27** (SVD routing at 50% hot, E5M3 cold up):
+Exp27 achieved match=0.834 (16.6% strict) with E5M3 cold up at 50% hot.
+Here, sparse_gate+e5m3_up at 50% hot gives 19.8% strict — 3.2 pp worse despite
+better routing quality (F1=0.913 vs 0.873).  The routing quality improvement
+did not compensate for the E5M3 up encoding penalty.  The penalty from E5M3
+cold up is independent of routing quality — it is a cold-up approximation error.
+
+### Conclusion
+
+**E5M3 B=8 encoding for cold W_up is not viable at 20–30% hot channels.**
+The penalty is 18–25 pp strict and 18–24 pp thermal — making E5M3 cold up
+nearly as bad as the sparse cold up from exp35 (which was already rejected).
+
+The confirmed architecture for the target regime is:
+
+```
+routing:   top-k(|x @ W_gate_sparse.T|)   kr=0.5+ft
+cold gate: x @ W_gate_sparse.T            [free — reuses routing GEMM]
+cold up:   x @ W_up_full.T                [MUST be full precision]
+hot:       full precision gate + up
+down:      full precision always
+```
+
+At 30% hot this gives strict=12.0%, thermal@T=1.0=**4.8%** (FP8-equivalent).
+No encoding of cold W_up is competitive with full precision at these hot fractions.
