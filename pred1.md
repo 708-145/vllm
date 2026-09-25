@@ -48,6 +48,11 @@
 | 36 | E5M3 B=8 cold up with sparse gate routing — e2e strict + thermal | cold gate = W_gate_sparse; cold up = E5M3 B=8 sign+scale; hot = full precision; down = full | @20% hot: strict=38.6%, **thermal@0.7=30.6%**; @30%: strict=30.0%, thermal@0.7=23.4%; @50%: strict=19.8%, thermal=10.8% | E5M3 cold up is far worse than full-precision up at sparse hot fractions (20–30%): +25 pp strict / +24 pp thermal at 20% hot; mean gap ~2.0 logits (hard errors). Only recovers at 50% hot (+6.6 pp strict, thermal@1.0=8.2%). W_up must stay full precision for cold channels regardless of up encoding scheme — confirming exp20 and exp35 at the cold-up encoding level |
 | 37 | 3bpw cold up: 2-bit/weight, 2 E5M3 scales per B=16 block, TARE-optimal EM, sparse gate routing — e2e strict + thermal | cold up = ±{s_lo,s_hi} per B=16, E5M3 quantised scales; hot = full; down = full | @20%: strict=24.4%, **thermal@0.7=15.6%**; @30%: strict=22.6%, thermal@0.7=13.2%; @50%: strict=16.8%, thermal@0.7=8.4% | 3bpw halves the penalty vs 1bpw E5M3 (~11 pp strict penalty vs ~22 pp at 20–30% hot), but still +7–9 pp thermal over full-precision up. Gap metric drops from 2.0 → 1.39 logits (softer errors) but not yet matching full-prec (1.06). At 50% hot, 3bpw is within 3 pp strict / 3 pp thermal of full-prec up. W_up cold must still be full precision for the 20–30% hot target regime |
 | 38 | 3bpw static encoding quality check — no routing, uniform encoding of individual matrices and combinations | gate=3bpw (no routing); gate+up=3bpw; gate+down=3bpw; all=3bpw | gate only: strict=49%, **thermal@0.7=46.2%**, gap=3.5L; gate+up: strict=96.4%, gap=8.5L; gate+down: strict=88.4%, gap=8.1L; all: strict=99.8%, gap=10.6L | 3bpw gate alone is already catastrophic (49% strict) without routing; gate+up compound to 96% perturbation. Confirms that hot/cold routing is not merely helpful but structurally essential — 3bpw encoding applied globally destroys output quality. Each additional encoded matrix compounds error multiplicatively: gate×up SwiGLU product doubles the noise, down projection broadcasts it over all output dims |
+| 39 | FP6 S1E2M3 (6.5bpw, B=16, 1 E5M3 block scale) static encoding quality check — no routing, same matrix combinations as exp38. **Note: E5M3 is not an OCP format; scale alignment is suboptimal vs E8M0.** | gate=FP6; gate+up=FP6; gate+down=FP6; all=FP6 | gate only: strict=22.6%, **thermal@0.7=15.0%**, gap=1.21L; gate+up: strict=81.6%, gap=4.7L; gate+down: strict=95.2%, gap=8.3L; all: strict=99.4%, gap=12.4L | FP6 gate alone is −28 pp better than 3bpw gate (22.6% vs 51%), confirming more mantissa bits help, but results are not representative of OCP MXFP6 due to the non-standard E5M3 block scale. See exp40 for the correct OCP MX comparison. |
+| 40 | OCP MXFP8-E4M3 / MXFP8-E5M2 / MXFP6-E3M2 / MXFP6-E2M3 static quality check — B=32, E8M0 block scale, no routing, all 4 matrix combinations | gate/up/down encoded uniformly per format | **MXFP8-E4M3 gate+up+down: strict=3.6%, thermal@0.7=0.4%**; MXFP6-E2M3 gate+up+down: strict=4.2%, thermal@0.7=0.8%; MXFP6-E3M2 gate+up+down: strict=7.8%, thermal@0.7=2.0%; MXFP8-E5M2 gate+up+down: strict=8.0%, thermal@0.7=2.2% | All four MX formats produce FP8-equivalent or better quality even when all three MLP matrices are encoded simultaneously with no routing. MXFP8-E4M3 and MXFP6-E2M3 both achieve ≤4.2% strict / ≤0.8% thermal@0.7 with all-matrix encoding. Confirms exp39 was dominated by the suboptimal E5M3 scale scheme, not a fundamental property of 6-bit weights. E8M0 power-of-two scaling is the key — near-zero perturbation even with MXFP6. |
+| 41 | MXFP6-E2M3 with E8M0 vs E5M3 block scale — controlled isolation of scale format, B=32, no routing | E8M0 (OCP power-of-two) vs E5M3 (TARE-optimal fine-grained), element format fixed to E2M3 | E8M0: gate_only=1.6%/0.0% thermal, all=4.2%/0.8%; **E5M3: gate_only=28.2%/18.2% thermal, all=99.0%/98.2%** | E8M0 is confirmed as the culprit: same E2M3 elements with E5M3 scale collapse from 4.2% to 99% perturbation on all-matrix encoding. The E5M3 TARE scale is accurate (geomean-aligned) but not power-of-two — the FP6 grid misaligns with the weight exponent field, producing large quantisation errors for most weights. E8M0's exact power-of-two alignment is the essential property of OCP MX, not the number of scale mantissa bits. |
+| 42 | 3bpw 2-level ±{s_lo,s_hi} with E8M0 scales vs E5M3 scales — B=16, TARE EM, no routing | E8M0 (power-of-two centroids, this exp) vs E5M3 centroids (exp38 ref) | E8M0: gate_only=49%/42.6% thermal, all=98.8%/97.8%; E5M3: gate_only=51%/46.2%, all=99.8%/99.2% | Unlike MXFP6, switching 3bpw to E8M0 scales gives only marginal improvement (~2 pp). Both variants are catastrophically bad. The 3bpw scheme has no explicit per-weight exponent field — weights are just ±s_lo or ±s_hi — so the power-of-two alignment benefit of E8M0 provides almost no gain. The 3bpw scheme is fundamentally limited by having only 2 magnitude levels per block, not by scale format. MXFP6-E2M3 (32 levels) with E8M0 remains the clear winner at similar storage cost. |
+| 43 | MXFP4-E2M1 (OCP, 4.25bpw) and hypothetical MXFP5-E2M2 (5.25bpw) — B=32, E8M0, no routing, all 4 matrix combinations; MXFP6-E2M3 inline for reference | E2M1 (8 codes, fp_max=6); E2M2 (16 codes, fp_max=7); E2M3 (32 codes, fp_max=7.5) | MXFP4 all: strict=17.2%, **thermal@0.7=8.6%**; MXFP5 all: strict=9.6%, thermal@0.7=3.6%; MXFP6 all: strict=4.2%, thermal@0.7=0.8% | MXFP4 lands in NVFP4 territory (17.2% strict all-matrix). Each mantissa bit halves the perturbation: MXFP4→5 saves ~8 pp strict, MXFP5→6 saves ~5 pp. MXFP5 thermal@0.7 on all-matrix (3.6%) is already FP8-equivalent — the extra mantissa bit over MXFP4 pushes it across the FP8 threshold. MXFP6 strictly better than MXFP5 at same exponent width. The E2Mx family shows clean monotone improvement with mantissa bits at E8M0 B=32. |
 
 
 ## Core idea
@@ -4094,3 +4099,455 @@ experiment provides a useful lower bound: any viable compression scheme for
 MLP weights in this architecture requires structured routing (hot/cold split)
 to remain in the FP8-equivalent regime.  Static global quantisation of MLP
 weights to 3bpw is not competitive with INT8/FP8 global schemes.
+
+
+## Experiment 39 — FP6 S1E2M3 static encoding quality check (no routing)
+
+**Goal:** Repeat the exp38 matrix-combination quality check using FP6 S1E2M3
+instead of 3bpw, to establish whether more mantissa bits (3 vs effectively 0)
+improve static encoding quality enough to change the routing requirement.
+
+**FP6 S1E2M3 format:** 1 sign bit, 2 exponent bits, 3 mantissa bits.
+Exponent bias = 1.  32 non-negative representable magnitudes spanning 0 to 7.5:
+
+```
+subnormal (e=0): 0.000, 0.125, 0.250, 0.375, 0.500, 0.625, 0.750, 0.875
+normal  e=1:     1.000, 1.125, 1.250, 1.375, 1.500, 1.625, 1.750, 1.875
+normal  e=2:     2.000, 2.250, 2.500, 2.750, 3.000, 3.250, 3.500, 3.750
+normal  e=3:     4.000, 4.500, 5.000, 5.500, 6.000, 6.500, 7.000, 7.500
+```
+
+**Encoding:** B=16, one TARE-optimal E5M3 block scale per block (same scale
+derivation as exp19/22).  Each weight encoded as sign × FP6(|w|/s) × s.
+
+**Storage:** 16 weights × 6 bits + 8 bits scale = 104 bits = 13 bytes per block
+= **6.5 bpw** = 2.46× vs BF16.  Slightly less compressed than 3bpw (2.67×)
+but with 15 magnitude levels per block vs 2.
+
+**Same 4 conditions as exp38** for direct comparison.
+
+### Results
+
+| Condition | Strict | Thermal@0.7 | Thermal@1.0 | Mean gap |
+|---|---|---|---|---|
+| gate only | 22.6% | 15.0% | 12.6% | 1.21 L |
+| gate + up | 81.6% | 76.4% | 73.8% | 4.74 L |
+| gate + down | 95.2% | 94.8% | 94.0% | 8.26 L |
+| gate + up + down | 99.4% | 99.2% | 98.8% | 12.42 L |
+
+### Comparison with exp38 (3bpw)
+
+| Condition | Δ strict | Δ thermal@0.7 | Δ gap@0.7 |
+|---|---|---|---|
+| gate only | **−28.4 pp** | **−31.2 pp** | **−2.32 L** |
+| gate + up | −14.8 pp | −18.2 pp | −3.74 L |
+| gate + down | +6.8 pp | +8.8 pp | +0.16 L |
+| gate + up + down | −0.4 pp | ≈0 pp | +1.82 L |
+
+### Analysis
+
+**Gate-only improves dramatically (+28 pp over 3bpw gate-only).**  FP6 has 15
+magnitude levels per block vs 2 for 3bpw, directly reducing the pre-SiLU gate
+approximation error.  The mean gap also drops from 3.53 L to 1.21 L — now in
+the same range as the routed sparse-gate experiments (exp34: 1.06 L @30% hot).
+This is the most important result: gate encoding quality matters a lot.
+
+However, 22.6% strict without routing is still nearly twice the 12% achieved
+*with* routing (@30% hot, exp33/34).  Routing adds 10+ pp on top of better
+encoding, by concentrating approximation error on channels where SiLU suppresses
+it.  The routing mechanism and encoding quality are complementary, not redundant.
+
+**Gate + up collapses to 81.6% strict.**  Adding FP6-encoded up degrades
+sharply despite FP6 being better than 3bpw per-matrix.  The SwiGLU product
+`SiLU(gate_enc) × up_enc` multiplies two independent error streams; both
+contain non-trivial errors at non-zero gate values, leading to near-total
+output disruption.  This re-confirms the exp20 finding that encoding W_up
+globally is incompatible with acceptable quality.
+
+**Gate + down (95.2%) is worse than exp38's gate + down (88.4%), by +7 pp.**
+This is counter-intuitive since FP6 gate is better than 3bpw gate.  The
+explanation lies in the error scale: FP6 gate errors are smaller in magnitude
+(gap 1.21 L vs 3.53 L), but those errors are spread over a wider dynamic range
+— the 15-level FP6 grid produces outputs that, when a wrong level is selected,
+are further from zero than 3bpw's 2-level approximation.  The down projection
+broadcasts gate errors linearly to all H=2560 output dimensions; a smaller-gap
+but wider-spread gate error can produce larger aggregate output error in certain
+directions.  Additionally the down projection itself (encoded FP6) introduces
+its own errors which compound with gate errors multiplicatively.
+
+**All three matrices (99.4%) remains near-total collapse** as in exp38.
+Individual matrix quality improvements do not carry over when all three are
+encoded simultaneously — errors compound across all three operations.
+
+### Key takeaway: FP6 gate is promising, up and down remain problematic
+
+The gate-only result (22.6% strict, gap 1.21 L) shows FP6 has significantly
+better gate encoding quality than 3bpw (49% strict, gap 3.53 L).  This opens
+a path for a future routing experiment: apply FP6 to cold gate channels instead
+of sparse gate, potentially combined with the existing full-precision cold up.
+The 1.21 L mean gap is already close to the routed sparse-gate gap of 1.06 L,
+suggesting FP6 cold gate might match or approach sparse gate quality without
+requiring a pre-computed sparse weight matrix.
+
+Encoding up or down globally remains unacceptable at any bpw tested so far.
+
+### Conclusion
+
+FP6 S1E2M3 substantially improves gate encoding quality over 3bpw (−28 pp
+strict, gap halved from 3.5 → 1.2 L) but does not eliminate the routing
+requirement.  Gate + up and gate + down combinations are still catastrophic.
+The result motivates a routing experiment using FP6 cold gate (instead of sparse
+W_gate) as the next step.
+
+
+## Experiment 39 — retrospective note on E5M3 block scale
+
+The exp39 results (gate-only 22.6% strict, all-matrix 99.4%) are **not
+representative of OCP MXFP6** quality.  The gap vs exp40 MXFP6-E2M3
+(gate-only 1.6% strict, all-matrix 4.2%) is enormous.
+
+The root cause is the block scale format:
+
+| Scale | Type | Representable values | Precision |
+|---|---|---|---|
+| E5M3 (exp39) | 5-bit exponent, 3-bit mantissa | ~240 positive values | Fine-grained, arbitrary powers |
+| **E8M0 (OCP MX)** | 8-bit exponent, 0-bit mantissa | 255 exact powers of 2 | Coarse steps but exact alignment |
+
+The E5M3 scale in exp39 uses the TARE-weighted geometric mean of `|w|` shifted
+to the FP6 grid centre — a heuristic alignment.  This leaves each weight
+needing to be represented as `sign × fp6_code × s` where `s` may not be
+aligned to the FP6 code boundaries.  The E8M0 power-of-two scale in OCP MX
+is mathematically designed so that the quantisation grid for `|w|/s` maps
+exactly onto the fp-format grid: the scale shifts the exponent of every weight
+by an integer number of bits, and the mantissa bits capture the remaining
+fractional part exactly.  This is why E8M0 + FP6 (MXFP6) achieves ~2% strict
+perturbation while E5M3 + FP6 achieves 22%.
+
+**The exp38/39 series was therefore not testing "FP6 quality" but rather
+"FP6 quality with a suboptimal non-power-of-two block scale".  Exp40 with
+proper OCP E8M0 scales gives the correct answer.**
+
+## Experiment 40 — OCP MXFP8 / MXFP6 static encoding quality check
+
+**Goal:** Measure top-1 perturbation for all four OCP MX element formats
+(MXFP8-E4M3, MXFP8-E5M2, MXFP6-E3M2, MXFP6-E2M3) with the correct
+OCP-specified E8M0 block scale and B=32, applied uniformly to all 40 layers
+with no routing, across the same four matrix combinations as exp38/39.
+
+### OCP MX format summary
+
+| Format | bpw (elem) | bpw (with B=32 E8M0 scale) | fp_max | codes |
+|---|---|---|---|---|
+| MXFP8-E4M3 | 8.0 | 8.25 | 448 | 127 (NaN excluded) |
+| MXFP8-E5M2 | 8.0 | 8.25 | 57344 | 124 (NaN/Inf excluded) |
+| MXFP6-E3M2 | 6.0 | 6.25 | 28 | 32 (no NaN in MX) |
+| MXFP6-E2M3 | 6.0 | 6.25 | 7.5 | 32 (no NaN in MX) |
+
+**E8M0 scale selection:** `scale = 2^ceil(log2(block_max / fp_max))` — the
+smallest power of two that maps the block maximum onto the fp-format maximum.
+
+### Results
+
+#### Perturbation rates (strict / thermal@0.7)
+
+| Condition | MXFP8-E4M3 | MXFP8-E5M2 | MXFP6-E3M2 | MXFP6-E2M3 |
+|---|---|---|---|---|
+| gate only | 1.6% / **0.0%** | 3.6% / 0.2% | 3.0% / 0.2% | 1.6% / **0.0%** |
+| gate + up | 2.8% / **0.0%** | 6.8% / 1.0% | 6.4% / 0.8% | 3.2% / 0.4% |
+| gate + down | 2.6% / 0.2% | 6.8% / 0.4% | 7.0% / 0.2% | 3.4% / **0.0%** |
+| **gate + up + down** | **3.6% / 0.4%** | 8.0% / 2.2% | 7.8% / 2.0% | **4.2% / 0.8%** |
+
+#### Mean logit gap (perturbed tokens only)
+
+| Condition | MXFP8-E4M3 | MXFP8-E5M2 | MXFP6-E3M2 | MXFP6-E2M3 |
+|---|---|---|---|---|
+| gate only | 0.04 L | 0.12 L | 0.13 L | 0.06 L |
+| gate + up | 0.10 L | 0.22 L | 0.24 L | 0.23 L |
+| gate + down | 0.12 L | 0.27 L | 0.27 L | 0.10 L |
+| gate + up + down | 0.17 L | 0.38 L | 0.37 L | 0.26 L |
+
+### Analysis
+
+**All four formats achieve FP8-equivalent or better quality across all matrix
+combinations.**  The best result — MXFP8-E4M3 gate+up+down — is 3.6% strict /
+0.4% thermal@0.7, squarely in the INT8 range and better than typical FP8
+quantisation schemes.  Even MXFP6-E2M3 with all three matrices reaches only
+4.2% strict / 0.8% thermal@0.7.
+
+**Format ordering:** MXFP8-E4M3 ≈ MXFP6-E2M3 > MXFP6-E3M2 ≈ MXFP8-E5M2.
+The E2M3 element formats (both FP6 and FP8) outperform the E3M2/E5M2 variants
+at these weight scales.  This reflects the weight distribution of Granite-4.2:
+weights are concentrated in a narrow dynamic range where higher mantissa
+precision matters more than a wider exponent range.
+
+**Mean gaps are tiny** (0.04–0.38 L) compared to the 1–10 L range seen in
+exp36–39.  All perturbations are soft near-ties — the model is functioning
+correctly and only occasionally permuting near-equal tokens.
+
+**The E8M0 scale is the key difference vs exp39.**  MXFP6-E2M3 with E5M3
+scale (exp39) gave 22.6% strict gate-only; with E8M0 scale the same element
+format gives 1.6% strict.  The power-of-two alignment exactly maps the
+weight's exponent bits into the FP6 code's exponent bits, leaving only
+mantissa rounding error.  No heuristic scale alignment can match this.
+
+**gate+down ≈ gate+up** (within ±0.4 pp across formats).  The anomaly from
+exp39 where gate+down >> gate+up disappears completely.  With proper E8M0
+scaling, down projection encodes with the same fidelity as gate/up, and
+the two errors contribute similarly to total perturbation.
+
+**Errors add approximately linearly:** gate+up+down ≈ gate + up + down
+perturbations for the two best formats.  No multiplicative error compounding.
+This is a strong indication that at MX-quality levels, the error magnitudes
+are small enough that cross-term interactions are negligible.
+
+### Implications for the routing scheme
+
+The exp33–37 routing scheme (sparse gate + full up cold) was motivated by the
+inability to encode W_up cold cheaply.  Exp40 shows that **MXFP6 or MXFP8
+applied to all three matrices globally already achieves ≤4.2% strict**.
+This is strictly better than the routing scheme's best result (exp33 @50% hot:
+12.4% strict).
+
+Two separate conclusions follow:
+
+1. **Global MX quantisation is a strong baseline** that the routing scheme
+   must beat to justify its complexity.  At 30% hot, exp33 gives 13.8% strict —
+   3× worse than MXFP8-E4M3 all-matrix.
+
+2. **Combining routing with MX cold encoding** (instead of full-precision cold)
+   could dramatically improve the routing scheme's cold quality.  If cold
+   channels can be MX-encoded at ~1–2% per-matrix error, the full cold
+   approximation may become viable — breaking the "cold W_up must be full
+   precision" constraint that has blocked progress since exp20.
+
+### Conclusion
+
+OCP MXFP8-E4M3 and MXFP6-E2M3 achieve FP8-equivalent quality (≤4.2% strict,
+≤0.8% thermal@0.7) even with all three MLP matrices encoded simultaneously
+and no routing.  The E8M0 power-of-two scale is essential — not the element
+bit-width.  Exp39's poor results were entirely due to the non-OCP E5M3 scale.
+The natural next step is to use MX encodings for cold channels in the routing
+scheme, replacing the full-precision cold-up constraint.
+
+
+## Experiment 41 — MXFP6-E2M3: E8M0 vs E5M3 block scale
+
+**Goal:** Confirm that E8M0 is the key to MXFP6's quality, not the element
+format.  Single controlled variable: block scale format (E8M0 vs E5M3), with
+element format fixed to MXFP6-E2M3, B=32, no routing, same 4 conditions.
+
+### Results
+
+| Condition | E8M0 strict | E8M0 th@0.7 | E5M3 strict | E5M3 th@0.7 | Δ strict |
+|---|---|---|---|---|---|
+| gate only | 1.6% | **0.0%** | 28.2% | 18.2% | +26.6 pp |
+| gate + up | 3.2% | 0.4% | 86.8% | 84.8% | +83.6 pp |
+| gate + down | 3.4% | **0.0%** | 98.0% | 97.8% | +94.6 pp |
+| gate + up + down | 4.2% | 0.8% | **99.0%** | 98.2% | +94.8 pp |
+
+Mean logit gap for E5M3 all-matrix: **15.24 L** — near-total model collapse.
+Mean logit gap for E8M0 all-matrix: **0.26 L** — soft near-ties only.
+
+### Analysis
+
+The result is unambiguous. Switching from E8M0 to E5M3 scale while keeping
+every other parameter identical degrades MXFP6-E2M3 all-matrix from 4.2%
+strict to 99.0% strict — a 94.8 pp collapse. The E5M3 scale is *more precise*
+than E8M0 (8 mantissa bits vs 0), yet it is catastrophically worse.
+
+**Why E8M0 works and E5M3 does not:**
+
+A floating-point number `w` with value `(1 + f) × 2^e` (f = mantissa fraction,
+e = exponent) is represented in FP6-E2M3 as:
+
+```
+w ≈ fp6_code × scale = (1 + m/8) × 2^(fp6_exp - 1) × scale
+```
+
+For this to be a faithful representation, `scale` must itself be a power of
+two — specifically `2^(e - fp6_exp + 1)`. Then:
+
+```
+w / scale = (1 + f) × 2^e / 2^(e - fp6_exp + 1)
+           = (1 + f) × 2^(fp6_exp - 1)
+```
+
+which is exactly within the range that the FP6 mantissa can represent.
+**Any non-power-of-two scale introduces a fractional exponent shift**, which
+is equivalent to multiplying every weight by an irrational constant before
+quantisation — the mantissa bits can no longer faithfully represent the result,
+and errors are ~0.5 ULP in the misaligned domain regardless of scale precision.
+
+The E5M3 TARE scale is optimal in the TARE metric sense (minimises
+scale-tilted relative error over the geometric mean of the block), but that
+metric assumes real-valued reconstruction. The FP format's exponent–mantissa
+factorisation means only power-of-two scales are algebraically compatible.
+
+**The failure is not a flaw in the TARE optimisation** — it correctly finds the
+best non-power-of-two scale for a real-valued proxy loss. The fundamental
+issue is that the TARE loss does not model the exponent–mantissa structure
+of the target format. E8M0 alignment is a *structural* requirement of
+block-scaled floating-point, not a quality-of-fit choice.
+
+### Conclusion
+
+**E8M0 is the culprit and the solution.** The OCP MX spec's choice of E8M0
+(power-of-two only scale, no mantissa bits) is not a simplification — it is
+the mathematically correct scale format for block-scaled floating-point
+encodings. Non-power-of-two scales like E5M3 introduce a systematic
+misalignment between the scale and the element format's exponent grid that
+cannot be corrected by better scale-finding heuristics.
+
+All future experiments using sub-BF16 weight encodings should use E8M0 scales.
+The TARE metric and E5M3 scale series (exp17–39) are superseded for any
+encoding that uses a floating-point element format with an explicit exponent
+field.
+
+
+## Experiment 42 — 3bpw with E8M0 scales vs E5M3 scales
+
+**Goal:** Apply the exp41 lesson (E8M0 vs E5M3 scale) to the 3bpw 2-level
+scheme.  If E8M0 dramatically fixed MXFP6, does it also fix 3bpw?
+
+**Encoding:** 2 bits per weight, 2 TARE-optimal power-of-two (E8M0) scales
+per B=16 block.  EM runs in log₂-space; centroids rounded to nearest integer
+log₂ (i.e. nearest power of two) at each M-step and finally.
+
+Storage: same as exp38 — 6 bytes / 16 weights = **3 bpw = 2.67× vs BF16**.
+
+### Results
+
+| Condition | E8M0 strict | E8M0 th@0.7 | E5M3 strict | E5M3 th@0.7 | Δ strict |
+|---|---|---|---|---|---|
+| gate only | 49.0% | 42.6% | 51.0% | 46.2% | −2.0 pp |
+| gate + up | 94.6% | 93.0% | 96.4% | 94.6% | −1.8 pp |
+| gate + down | 90.8% | 87.0% | 88.4% | 86.0% | +2.4 pp |
+| gate + up + down | 98.8% | 97.8% | 99.8% | 99.2% | −1.0 pp |
+
+### Context: full comparison table
+
+| Condition | 3bpw E5M3 | 3bpw E8M0 | MXFP6-E2M3 E8M0 |
+|---|---|---|---|
+| gate only | 51% / 46% | 49% / 43% | **1.6% / 0.0%** |
+| gate + up | 96% / 95% | 95% / 93% | **3.2% / 0.4%** |
+| gate + down | 88% / 86% | 91% / 87% | **3.4% / 0.0%** |
+| gate + up + down | 100% / 99% | 99% / 98% | **4.2% / 0.8%** |
+
+### Analysis
+
+**E8M0 barely helps 3bpw.**  The maximum improvement is 2 pp strict
+(gate-only), compared to the 26 pp improvement it gave MXFP6 in exp41.  Both
+3bpw variants remain catastrophically bad across all conditions.
+
+The reason is structural and now clear: the exp41 analysis identified that
+E8M0 works because it aligns the scale's power-of-two steps with the
+**exponent field** of the floating-point element format.  The 3bpw scheme has
+no exponent field per weight — each weight is simply `±s_lo` or `±s_hi`, two
+scalar values.  There is no floating-point mantissa to align to; E8M0 and E5M3
+scales produce identically-structured approximations, differing only in the
+discrete set of values that the centroids can take.
+
+In fact, E8M0 is slightly *worse* for 3bpw than E5M3 in the gate+down
+condition (+2.4 pp), because forcing centroids to exact powers of two can
+be a worse fit to the actual block weight distribution than E5M3's finer grid.
+The TARE metric is genuinely trying to minimise reconstruction error, and
+constraining centroids to powers of two throws away that optimality for free.
+
+**The fundamental 3bpw problem is the number of levels, not the scale
+format.**  With only 2 magnitude levels per block of 16 weights, the scheme
+has a quantisation granularity floor of ~1 bit/weight of effective precision
+after the sign.  No scale choice can compensate for representing 16 diverse
+weights with just two magnitudes.  MXFP6-E2M3 has 16 non-negative magnitudes
+(32 codes total) — 8× more — and that is why it works.
+
+### Conclusion
+
+3bpw with E8M0 scales is no better than 3bpw with E5M3 scales (≤2 pp
+difference, no consistent direction).  The 3bpw scheme is limited by level
+count, not scale format.  The correct way to improve 3bpw is to add more
+levels — which is exactly what MXFP6 does.  The encoding series exp37→42
+converges on OCP MXFP6-E2M3 with E8M0 scale as the correct 3-bpw-class
+encoding, at 6.25 bpw vs 3 bpw but with 30× better quality (4.2% vs 99%).
+
+
+## Experiment 43 — MXFP4-E2M1 and hypothetical MXFP5-E2M2
+
+**Goal:** Extend the E2Mx progression below MXFP6 to characterise the
+quality cliff as mantissa bits are removed.
+
+### Format definitions
+
+| Format | Element bits | Codes | fp_max | bpw (B=32 E8M0) |
+|---|---|---|---|---|
+| MXFP4-E2M1 | 4 (OCP standard) | 8 | 6.0 | 4.25 |
+| MXFP5-E2M2 | 5 (hypothetical) | 16 | 7.0 | 5.25 |
+| MXFP6-E2M3 | 6 (OCP standard) | 32 | 7.5 | 6.25 |
+
+MXFP5-E2M2 non-negative codes: `0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0`
+
+### Results — perturbation rates (strict% / thermal@0.7%)
+
+| Condition | MXFP4-E2M1 | MXFP5-E2M2 | MXFP6-E2M3 | MXFP8-E4M3 |
+|---|---|---|---|---|
+| gate only | 8.8% / 2.6% | 4.8% / 0.8% | 1.6% / 0.0% | 1.6% / 0.0% |
+| gate + up | 12.2% / 5.2% | 7.4% / 2.0% | 3.2% / 0.4% | 2.8% / 0.0% |
+| gate + down | 15.4% / 7.0% | 7.4% / 3.0% | 3.4% / 0.0% | 2.6% / 0.2% |
+| **gate + up + down** | **17.2% / 8.6%** | **9.6% / 3.6%** | **4.2% / 0.8%** | **3.6% / 0.4%** |
+
+### Mean logit gap (all-matrix)
+
+| Format | gap@0.7 |
+|---|---|
+| MXFP4-E2M1 | 1.285 L |
+| MXFP5-E2M2 | 0.657 L |
+| MXFP6-E2M3 | 0.265 L |
+| MXFP8-E4M3 | 0.172 L |
+
+### Analysis
+
+**MXFP4 all-matrix (17.2% strict / 8.6% thermal@0.7) sits squarely in the
+NVFP4 territory.** This matches the hardware expectation: OCP MXFP4 is
+designed as a peer to NVIDIA's FP4 formats for Blackwell, and the ~10–20%
+strict perturbation range is the known quality regime for 4-bit inference.
+Thermally, 8.6% at T=0.7 sits just above the FP8 floor (~3–5%), meaning
+MXFP4 errors are mostly real (mean gap 1.29 L — significant but not
+catastrophic).
+
+**MXFP5 all-matrix (9.6% strict / 3.6% thermal@0.7) crosses the FP8
+threshold thermally.** Strict perturbation is still in the NVFP4 range, but
+thermal@0.7 at 3.6% is within the FP8-equivalent band (~2–4%). The extra
+mantissa bit over MXFP4 halves the thermal perturbation. This format doesn't
+exist in any hardware standard today but the numbers suggest it would be a
+compelling sweet spot: better than NVFP4 at a ~1 bpw premium over MXFP4.
+
+**Each mantissa bit roughly halves perturbation** across the E2Mx family:
+
+| Step | Δ strict (all-matrix) | Δ thermal@0.7 |
+|---|---|---|
+| MXFP4→5 (+1 bit, +1 bpw) | −7.6 pp | −5.0 pp |
+| MXFP5→6 (+1 bit, +1 bpw) | −5.4 pp | −2.8 pp |
+| MXFP6→8 (+2 bits, +2 bpw) | −0.6 pp | −0.4 pp |
+
+The marginal return diminishes rapidly: going from 5→6 bits gives nearly as
+much gain as going from 6→8 bits. **MXFP6-E2M3 is the knee of the curve**
+for this model and weight distribution.
+
+**MXFP8-E4M3 vs MXFP6-E2M3:** only 0.6 pp strict / 0.4 pp thermal difference
+on all-matrix encoding. The two formats are essentially tied at this quality
+level — the extra 2 bpw of MXFP8 buys almost nothing for Granite-4.2-3b MLP
+weights in the absence of activations (weight-only quantisation context).
+
+**The gate+down anomaly from exp39 does not reappear** in any format. With
+E8M0 scales, gate+down ≈ gate+up across all formats (within ±0.4 pp). This
+confirms the exp41/42 analysis: the earlier anomaly was entirely a scale
+alignment artefact.
+
+### Conclusion
+
+The E2Mx family with E8M0 B=32 scales shows clean monotone improvement with
+mantissa bits. The quality cliff is at MXFP4→5: removing the second mantissa
+bit pushes the all-matrix perturbation from FP8-equivalent (3.6% thermal) to
+NVFP4 territory (8.6% thermal). MXFP5 is the minimum-bpw format that achieves
+FP8-equivalent thermal quality at 5.25 bpw. MXFP6-E2M3 at 6.25 bpw is the
+practical operating point with clear headroom. MXFP8-E4M3 offers negligible
+further improvement over MXFP6 for static weight encoding.
