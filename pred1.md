@@ -56,6 +56,7 @@
 | 44 | E5M0 vs E8M0 block scale + scale distribution — MXFP4/5/6-E2Mx, B=32 | E8M0 (range 2^±127) vs E5M0 (range 2^±15); element formats unchanged; plus full scale exponent histogram | **Δ = 0.0 pp everywhere**; scales span only e∈[−12, −3], 10 distinct values; 66% of blocks use e∈{−8,−7}; 4 bits would cover the full observed range | E8M0 range entirely unused. All 78.6M blocks have e∈[−12, −3]. Distribution is bimodal: e=−8 (32.5%) and e=−7 (33.6%) account for 66% of all blocks; e∈[−10,−7] covers 99.3%. A 4-bit scale (16 values) or even E4M0 would be sufficient for this model. |
 | 44b | LUT-based mixed-mode scale scheme: bit-cost analysis — no new inference; analytical follow-on to exp44 | Scale distribution from exp44; 3 modes: ≤2 scales→1 bit/block, 3–4 scales→2 bits/block, ≥5 scales→4 bits/block; 2-bit per-channel mode flag | **1.461 bits/block** actual overhead (1.266 index + 0.194 LUT amortisation); mode-0: 76.6% of channels, mode-1: 22.9%, mode-2: 0.4%; MXFP6-E2M3 total = **6.046 bpw** vs 6.250 flat | E8M0 scale overhead reduced 5.5× (8.00 → 1.46 bits/block), saving 0.204 bpw. Mode-2's 16-entry LUT is over-provisioned — 2 bits (4 entries) covers 99.6% of channels. User estimate of ~1.2 bits/block was close; actual 1.46 driven by 23% mode-1 channels (2 bits/block each). |
 | 44c | LUT scheme applied to MXFP5-E2M2 and MXFP4-E2M1 — analytical extension; no new inference | Same LUT channel assignment (format-independent); only element bpw changes: MXFP4=4 bits/weight, MXFP5=5, MXFP6=6; scale overhead = 1.461/32 = **0.04566 bpw** in all cases | MXFP4+LUT: **4.046 bpw** (saving 0.204 bpw / 4.8%); MXFP5+LUT: **5.046 bpw** (3.9%); MXFP6+LUT: **6.046 bpw** (3.3%). Quality unchanged: LUT is lossless scale re-encoding. MLP total: MXFP5+LUT=1.59 GB, MXFP4+LUT=1.27 GB vs BF16 5.03 GB | Absolute scale saving (0.204 bpw) is identical across all E2Mx formats — it is purely a scale-field reduction. MXFP5+LUT (5.046 bpw, thermal@0.7=3.6%) is the practical sweet spot: FP8-equivalent quality at 3.17× BF16 compression. MXFP4+LUT buys another 0.77 GB at the cost of crossing back above the FP8 thermal threshold. |
+| 44d | MXFP4-E2M1 code usage histogram + LUT12 feasibility — weight analysis + all-matrix quality run | All 2.5B weight slots encoded as MXFP4; code counts per unsigned magnitude; LUT12 = drop 4 least-used codes (0.0, 3.0, 4.0, 6.0), remap to nearest retained | Usage: top-4 codes (0.5→22.3%, 1.0→19.0%, 0.0→11.9%, 1.5→14.9%) cover 68%; bottom-4 cover 28.8%; drop4 maps 3.0/4.0/6.0→2.0 and 0.0→0.5. LUT12 all-matrix: **strict=94.8%, thermal@0.7=92.6%** (baseline: 17.2%/8.6%) | **LUT12 is catastrophically bad (+77.6 pp strict).** The 4 least-used codes by count are structurally critical: zero suppresses 11.9% of weights (replacing with ±0.5 adds correlated noise); {3.0,4.0,6.0} cover the top 16.9% of the dynamic range (all collapse to 2.0). MXFP4 has 8 load-bearing codes — usage skew reflects the weight distribution, not code redundancy. A feasible 12-code variant would require a redesigned non-uniform codebook, not code pruning. |
 
 
 ## Core idea
@@ -4819,3 +4820,106 @@ The total MLP weight budget is 40 layers × (2×8192×2560 + 8192×2560) weights
 | MXFP4+LUT | 4.046 | 1.27 GB | **3.95× smaller** |
 
 **Conclusion:** The LUT scheme delivers the same 0.204 bpw saving regardless of element format. At MXFP4 this represents a 4.8% reduction (the largest relative gain), but MXFP4's 8.6% thermal perturbation means it sits firmly in NVFP4 territory regardless of scale encoding. MXFP5+LUT at 5.046 bpw is the practical sweet spot: FP8-equivalent thermal quality, 3.17× BF16 compression, and the LUT scheme squeezes an extra 200 MB out vs flat E8M0.
+
+## Experiment 44d — MXFP4-E2M1 code usage and LUT12 feasibility
+
+**Goal:** Are all 16 signed MXFP4 codes used evenly? Could the 4 least-used codes
+be pruned to a "LUT12" scheme (12 effective values) without significant quality loss?
+
+### Code usage
+
+MXFP4-E2M1 has 8 non-negative magnitudes (with sign: 15 distinct values, or 16 signed
+slots treating ±0 separately). Measured across all 2,516,582,400 weight slots
+(40 layers × gate + up + down):
+
+| idx | value | count | % | cumul% | gate% | up% | down% |
+|---|---|---|---|---|---|---|---|
+| 0 | 0.00 | 299,029,544 | **11.88%** | 11.88% | 11.80% | 11.70% | 12.15% |
+| 1 | 0.50 | 562,273,446 | **22.34%** | 34.22% | 22.21% | 22.02% | 22.80% |
+| 2 | 1.00 | 478,236,621 | **19.00%** | 53.23% | 18.92% | 18.82% | 19.26% |
+| 3 | 1.50 | 375,798,286 | **14.93%** | 68.16% | 14.87% | 14.94% | 14.98% |
+| 4 | 2.00 | 375,108,597 | **14.91%** | 83.07% | 14.85% | 15.20% | 14.67% |
+| 5 | 3.00 | 263,297,971 | **10.46%** | 93.53% | 10.53% | 10.83% | 10.03% |
+| 6 | 4.00 | 134,759,677 |  **5.36%** | 98.88% |  5.58% |  5.44% |  5.04% |
+| 7 | 6.00 |  28,078,258 |  **1.12%** | 100.0% |  1.23% |  1.04% |  1.08% |
+
+**Observations:**
+
+1. **Distribution is strongly monotone-decreasing with magnitude.** Usage drops
+   nearly geometrically: 0.5 is the most common code (22.3%), and 6.0 (fp_max) is
+   used only 1.1% of the time — 20× less than index 1.
+
+2. **No code is truly unused.** Even the rarest code (6.0) appears 28M times.
+   Codes 0–5 account for 93.5% of all slots; code 6 (4.0) adds 5.4%; code 7 (6.0)
+   adds the final 1.1%.
+
+3. **Distribution is consistent across all three matrices** (gate/up/down %) —
+   no projection is structurally different in code usage.
+
+4. **The codes are not used evenly.** The top-4 codes (0.5, 1.0, 0.0, 1.5)
+   account for 68% of all slots. The bottom-4 by count are: 6.0 (1.1%),
+   4.0 (5.4%), 3.0 (10.5%), 0.0 (11.9%) — a combined 28.8%.
+
+### LUT12 feasibility
+
+The 4 least-used codes by count are: **{0.0, 3.0, 4.0, 6.0}** (indices 0, 5, 6, 7).
+These are remapped to their nearest retained neighbour:
+
+| Dropped code | Nearest retained | Remap |
+|---|---|---|
+| 0.0 (idx 0) | 0.5 (idx 1) | 0.0 → 0.5 |
+| 3.0 (idx 5) | 2.0 (idx 4) | 3.0 → 2.0 |
+| 4.0 (idx 6) | 2.0 (idx 4) | 4.0 → 2.0 |
+| 6.0 (idx 7) | 2.0 (idx 4) | 6.0 → 2.0 |
+
+**Quality result (all-matrix gate+up+down, same calibration set):**
+
+| Scheme | strict% | thermal@0.7% | thermal@1.0% |
+|---|---|---|---|
+| MXFP4-E2M1 (baseline) | **17.2%** | **8.6%** | **7.6%** |
+| MXFP4-LUT12 (4 pruned) | **94.8%** | **92.6%** | **91.4%** |
+
+**LUT12 is catastrophically bad.** Perturbation jumps from 17% to 95%.
+
+### Why it fails — structural analysis
+
+The 4 least-used codes are not randomly distributed — they are **structurally
+critical**:
+
+- **Dropping zero (0.0 → 0.5):** Every weight that rounds to zero (11.9% of slots)
+  is forced to ±0.5 instead. This is equivalent to adding dense noise with
+  magnitude ~0.5×scale to 12% of all weights — exactly the channels where the
+  model has learned to suppress output.
+
+- **Dropping the three large-magnitude codes (3.0, 4.0, 6.0 → all → 2.0):**
+  The top of the representable range collapses. Any weight that needed magnitudes
+  in [3, 6] (16.9% of slots) is clamped to 2.0×scale — a severe truncation of the
+  weight distribution's tail. The nearest-neighbour collapse maps three distinct
+  codes to the same value, breaking the monotone grid entirely.
+
+The root cause is that MXFP4's 8 codes are *geometrically spaced* across the full
+dynamic range — every code is load-bearing. The "4 least used by count" happen to
+be the zero, the two highest-magnitude codes, and one mid-range code; together they
+bracket the entire representable range. Removing them is not pruning dead weight,
+it is amputating the dynamic range.
+
+### Could any 4 codes be pruned?
+
+The distribution shows why no set of 4 codes can safely be dropped:
+
+- Codes 0–4 (0.0–2.0) are the high-usage core; removing any of them would affect
+  14–22% of weight slots.
+- Codes 5–7 (3.0–6.0) are the low-usage tail, but they are essential for
+  representing outlier weights. Removing them truncates the dynamic range and
+  collapses 16.9% of weights to 2.0.
+- Removing **zero specifically** is uniquely harmful: the model uses exact zeros to
+  implement structured suppression (especially in cold-channel regimes), and
+  replacing them with ±0.5 creates correlated noise at precisely the slots that
+  should be silent.
+
+**Conclusion: LUT12 is not feasible for MXFP4.** The format has 8 codes because
+they are each necessary. The usage skew (22% for code 1 vs 1% for code 7) reflects
+the natural weight magnitude distribution, not code redundancy. A genuine 12-code
+variant would require redesigning the codebook (e.g. non-uniform spacing with more
+resolution near zero), not simply dropping the least-used entries from the existing
+OCP grid.
