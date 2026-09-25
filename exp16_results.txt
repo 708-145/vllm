@@ -1,0 +1,151 @@
+Loaded 8 prompts.
+INFO 09-23 15:32:36 [importing.py:98] Triton not installed or not compatible; certain GPU-related functions will not be available.
+INFO 09-23 15:32:37 [api_utils.py:286] non-default args: {'dtype': 'bfloat16', 'max_model_len': 512, 'enable_prefix_caching': False, 'kv_cache_memory_bytes': 536870912, 'disable_log_stats': True, 'enforce_eager': True, 'model': 'ibm-granite/granite-4.2-3b'}
+WARNING 09-23 15:32:37 [arg_utils.py:1764] The global random seed is set to 0. Since VLLM_ENABLE_V1_MULTIPROCESSING is set to False, this may affect the random state of the Python process that launched vLLM.
+INFO 09-23 15:32:38 [model.py:691] Resolved architecture: GraniteForCausalLM
+INFO 09-23 15:32:38 [model.py:2031] Using max model len 512
+INFO 09-23 15:32:38 [scheduler.py:277] Chunked prefill is enabled with max_num_batched_tokens=4096.
+WARNING 09-23 15:32:38 [vllm.py:1379] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 09-23 15:32:38 [vllm.py:1414] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 09-23 15:32:38 [kernel.py:372] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+WARNING 09-23 15:32:38 [vllm.py:671] Model Runner V2 requires Triton; using the V1 model runner instead.
+INFO 09-23 15:32:38 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+INFO 09-23 15:32:39 [core.py:123] Initializing a V1 LLM engine (v0.28.1rc1.dev393+g3f227e5d5.d20260904) with config: model='ibm-granite/granite-4.2-3b', speculative_config=None, tokenizer='ibm-granite/granite-4.2-3b', skip_tokenizer_init=False, tokenizer_mode=auto, revision=main, tokenizer_revision=main, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=512, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=True, quantization=None, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cpu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=ibm-granite/granite-4.2-3b, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all', '+gelu', '+gelu_tanh', '+gelu_and_mul'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': None, 'compile_ranges_endpoints': [4096], 'inductor_compile_config': {'enable_auto_functionalized_v2': False}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': None, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+INFO 09-23 15:32:39 [parallel_state.py:1798] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///var/folders/kg/6s56khd50xscgyj7q57h1k6w0000gn/T/vllm_dist_0dedf1472ea64b39bdb499ad1284d03f backend=gloo
+INFO 09-23 15:32:39 [parallel_state.py:2142] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+INFO 09-23 15:32:39 [cpu_model_runner.py:131] Starting to load model ibm-granite/granite-4.2-3b...
+WARNING 09-23 15:32:39 [compilation.py:1354] Op 'gelu' not present in model, enabling with '+gelu' has no effect
+WARNING 09-23 15:32:39 [compilation.py:1354] Op 'gelu_tanh' not present in model, enabling with '+gelu_tanh' has no effect
+WARNING 09-23 15:32:39 [compilation.py:1354] Op 'gelu_and_mul' not present in model, enabling with '+gelu_and_mul' has no effect
+INFO 09-23 15:32:39 [weight_utils.py:863] Filesystem type for checkpoints: unknown. Checkpoint size: 6.82 GiB. Available RAM: 16.63 GiB.
+INFO 09-23 15:32:39 [weight_utils.py:886] Auto-prefetch is disabled because the filesystem (unknown) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:  50% Completed | 1/2 [00:02<00:02,  2.42s/it]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:04<00:00,  2.17s/it]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:04<00:00,  2.21s/it]
+
+INFO 09-23 15:32:44 [default_loader.py:430] Loading weights took 4.43 seconds
+INFO 09-23 15:32:44 [utils.py:306] Using LBHNC KV cache layout.
+INFO 09-23 15:32:44 [cpu_worker.py:255] Explicitly set (0.5/36.0) GiB for KV cache on node 0.
+INFO 09-23 15:32:44 [kv_cache_utils.py:2312] GPU KV cache size: 6,528 tokens, Maximum concurrency for 512 tokens per request: 12.75x
+INFO 09-23 15:32:44 [core.py:379] init engine (profile, create kv cache, warmup model) took 0.02 s
+WARNING 09-23 15:32:44 [cpu_worker.py:153] CPU backend doesn't allow to use `torch.set_num_threads` after the thread binding, skip it.
+INFO 09-23 15:32:45 [hf.py:589] Detected the chat template content format to be 'string'. You can set `--chat-template-content-format` to override this.
+WARNING 09-23 15:32:45 [cpu_worker.py:153] CPU backend doesn't allow to use `torch.set_num_threads` after the thread binding, skip it.
+WARNING 09-23 15:32:45 [cpu_worker.py:153] CPU backend doesn't allow to use `torch.set_num_threads` after the thread binding, skip it.
+WARNING 09-23 15:32:45 [cpu_worker.py:153] CPU backend doesn't allow to use `torch.set_num_threads` after the thread binding, skip it.
+Baseline pass...
+  500 prefill-token predictions captured.
+
+Single-layer sweep (40 passes)...
+  layer  0  perturb=0.0900
+  layer  1  perturb=0.0700
+  layer  2  perturb=0.0840
+  layer  3  perturb=0.0820
+  layer  4  perturb=0.0680
+  layer  5  perturb=0.0600
+  layer  6  perturb=0.0780
+  layer  7  perturb=0.0620
+  layer  8  perturb=0.0620
+  layer  9  perturb=0.0600
+  layer 10  perturb=0.0700
+  layer 11  perturb=0.0680
+  layer 12  perturb=0.0720
+  layer 13  perturb=0.0740
+  layer 14  perturb=0.0740
+  layer 15  perturb=0.0780
+  layer 16  perturb=0.0820
+  layer 17  perturb=0.1040
+  layer 18  perturb=0.0540
+  layer 19  perturb=0.0560
+  layer 20  perturb=0.0620
+  layer 21  perturb=0.0580
+  layer 22  perturb=0.0560
+  layer 23  perturb=0.0540
+  layer 24  perturb=0.0620
+  layer 25  perturb=0.0400
+  layer 26  perturb=0.0420
+  layer 27  perturb=0.0500
+  layer 28  perturb=0.0400
+  layer 29  perturb=0.0640
+  layer 30  perturb=0.0440
+  layer 31  perturb=0.0520
+  layer 32  perturb=0.0720
+  layer 33  perturb=0.0640
+  layer 34  perturb=0.0700
+  layer 35  perturb=0.0760
+  layer 36  perturb=0.0780
+  layer 37  perturb=0.0480
+  layer 38  perturb=0.0820
+  layer 39  perturb=0.1340
+
+Cumulative sweep...
+  top- 1 layers  perturb=0.1340
+  top- 2 layers  perturb=0.1720
+  top- 4 layers  perturb=0.2240
+  top- 8 layers  perturb=0.2540
+  top-16 layers  perturb=0.3360
+  top-24 layers  perturb=0.3900
+  top-32 layers  perturb=0.4540
+  top-40 layers  perturb=0.4840
+
+--- Experiment 16 Results (hot=10%, tau_gate=0.75) ---
+
+Single-layer perturbation (approximating one layer at a time):
+  Layer   Perturb
+      0    0.0900
+      1    0.0700
+      2    0.0840
+      3    0.0820
+      4    0.0680
+      5    0.0600
+      6    0.0780
+      7    0.0620
+      8    0.0620
+      9    0.0600
+     10    0.0700
+     11    0.0680
+     12    0.0720
+     13    0.0740
+     14    0.0740
+     15    0.0780
+     16    0.0820
+     17    0.1040
+     18    0.0540
+     19    0.0560
+     20    0.0620
+     21    0.0580
+     22    0.0560
+     23    0.0540
+     24    0.0620
+     25    0.0400
+     26    0.0420
+     27    0.0500
+     28    0.0400
+     29    0.0640
+     30    0.0440
+     31    0.0520
+     32    0.0720
+     33    0.0640
+     34    0.0700
+     35    0.0760
+     36    0.0780
+     37    0.0480
+     38    0.0820
+     39    0.1340
+
+Layers ranked by single-layer contribution (highest first):
+  39, 17, 0, 2, 38, 3, 16, 36, 15, 6, 35, 13, 14, 12, 32, 34, 1, 10, 11, 4 ...
+
+Cumulative perturbation (top-k layers by contribution):
+     k                            Layers (top-k)   Perturb    Match
+     1  [np.int64(39)]                              0.1340   0.8660
+     2  [np.int64(39), np.int64(17)]                0.1720   0.8280
+     4  [np.int64(39), np.int64(17), np.int64(0), np.int64(2)]    0.2240   0.7760
+     8  [np.int64(39), np.int64(17), np.int64(0), np.int64(2), np.int64(38), np.int64(3), np.int64(16), np.int64(36)]    0.2540   0.7460
+    16  [np.int64(39), np.int64(17), np.int64(0), np.int64(2), np.int64(38), np.int64(3), np.int64(16), np.int64(36), np.int64(15), np.int64(6), np.int64(35), np.int64(13), np.int64(14), np.int64(12), np.int64(32), np.int64(34)]    0.3360   0.6640
+    24  [np.int64(39), np.int64(17), np.int64(0), np.int64(2), np.int64(38), np.int64(3), np.int64(16), np.int64(36), np.int64(15), np.int64(6), np.int64(35), np.int64(13), np.int64(14), np.int64(12), np.int64(32), np.int64(34), np.int64(1), np.int64(10), np.int64(11), np.int64(4), np.int64(29), np.int64(33), np.int64(20), np.int64(8)]    0.3900   0.6100
+    32  [np.int64(39), np.int64(17), np.int64(0), np.int64(2), np.int64(38), np.int64(3), np.int64(16), np.int64(36), np.int64(15), np.int64(6), np.int64(35), np.int64(13), np.int64(14), np.int64(12), np.int64(32), np.int64(34), np.int64(1), np.int64(10), np.int64(11), np.int64(4), np.int64(29), np.int64(33), np.int64(20), np.int64(8), np.int64(24), np.int64(7), np.int64(9), np.int64(5), np.int64(21), np.int64(19), np.int64(22), np.int64(23)]    0.4540   0.5460
+    40  [np.int64(39), np.int64(17), np.int64(0), np.int64(2), np.int64(38), np.int64(3), np.int64(16), np.int64(36), np.int64(15), np.int64(6), np.int64(35), np.int64(13), np.int64(14), np.int64(12), np.int64(32), np.int64(34), np.int64(1), np.int64(10), np.int64(11), np.int64(4), np.int64(29), np.int64(33), np.int64(20), np.int64(8), np.int64(24), np.int64(7), np.int64(9), np.int64(5), np.int64(21), np.int64(19), np.int64(22), np.int64(23), np.int64(18), np.int64(31), np.int64(27), np.int64(37), np.int64(30), np.int64(26), np.int64(25), np.int64(28)]    0.4840   0.5160
+
+  (All 40 layers, exp14 reference: perturb=0.484, match=0.516)

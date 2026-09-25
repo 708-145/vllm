@@ -44,6 +44,7 @@
 | 32 | Sparse W_gate predictor: magnitude pruning (unstructured + row-wise) ± 300-step Adam fine-tune, keep_rates 0.1–0.5 — routing quality only | Top-k on \|x @ W_sparse.T\|, 5 layers [0,8,16,24,32] | Unstructured keep=0.5: F1=0.880 @20%, 0.913 @50%; +ft: 0.902/0.932. Row pruning: F1=0.623 @50% keep, flat across hot%; fine-tune has no effect on row scheme | Unstructured magnitude pruning beats E5M3 (0.784) even at keep=0.3 (0.783); fine-tuning adds +2–7 pp; row pruning is much weaker and unimprovable by fine-tuning (zeroed rows have zero gradient); 50% unstructured sparsity gives E5M3-level routing at 50% GEMM cost |
 | 33 | Sparse W_gate e2e top-1: unstructured keep=0.5 ± 300-step Adam ft, top-k routing, cold gate from sparse, up always full — e2e top-1 | Top-k on \|x @ W_sparse.T\|, cold gate = x @ W_sparse.T | kr=0.5+ft: **0.850 @20%, 0.862 @30%, 0.876 @50%**; kr=0.5 no-ft: 0.830/0.830/0.852 | New best across all hot fractions: +24 pp vs exp27 @20%, +16 pp @30%, +4 pp @50%; fine-tuning adds +2 pp; sparse W_gate doubles as routing signal and cold approximation, eliminating E5M3 encoding step entirely |
 | 34 | Thermal match rate for exp33 kr=0.5+ft and exp24 reference schemes — new metric | Thermal match (T=0.7/1.0, τ=ln2): forgive if gap < T·ln2 | sparse @20%: strict=15.0%, **thermal@0.7=5.6%, thermal@1.0=5.0%**; sparse @50%: strict=12.4%, **thermal@0.7=4.8%, thermal@1.0=3.6%** | Thermal metric reveals ~8–10 pp of strict perturbation is below the noise floor at T=0.7; exp33 @50% hot is effectively FP8-equivalent (3.6% thermal@1.0); exp24 E5M3 T=0.20 drops from 18.2% strict → 7.6% thermal@0.7; exp24 T=0.50 still 16% thermal — its errors are harder (large gap ~1.27 logits) |
+| 35 | Sparse up projection + zero-cold comparison; target regime 20–30% hot; strict + thermal metric | gate routing: top-k(\|x @ W_gate_sparse.T\|); cold gate = W_gate_sparse, cold up = W_up_sparse or zero; up always full for hot | sparse_gate+up @20%: strict=21.2%, **thermal@0.7=9.4%**; sparse_gate+up @30%: strict=18.4%, **thermal@0.7=8.6%**; zero_cold @20%: strict=76.8%, thermal=73.4% | Sparse up cold is worse than full-precision up (exp33): +7.8 pp strict at 20% hot; however thermal gap is narrower (+2.8 pp). Zero cold is catastrophically hard (gap 5.3 logits @20%): omitting cold channels is a hard error, not recoverable thermally. Sparse_gate_only @30% hot is the new sweet spot: strict=12.0%, thermal@0.7=5.6%, thermal@1.0=4.8% — FP8-equivalent at T=1.0 at the target hot fraction |
 
 
 ## Core idea
@@ -3626,3 +3627,128 @@ quality at T=1.0, using only 50% of the W_gate weights for routing.
 The strict metric remains useful as a conservative upper bound and for
 comparing schemes against each other.  The thermal metric is the right number
 to report when assessing user-visible quality impact.
+
+---
+
+## Experiment 35 — Sparse up projection and zero-cold comparison
+
+### Motivation
+
+Exp33 kept W_up at full precision for cold channels.  This experiment targets the
+**20–30% hot regime** and asks two questions:
+
+1. Does sparsifying W_up for cold channels (same kr=0.5+ft scheme) help or hurt
+   compared to always-full-precision up?
+2. Is omitting cold channels entirely (feeding zeros to the down projection) a
+   hard or soft error under the thermal metric?
+
+### Schemes compared
+
+| Label | Cold gate | Cold up | Hot gate | Hot up |
+|---|---|---|---|---|
+| `sparse_gate_only` | `x @ W_gate_sparse.T` | `x @ W_up_full.T` (full) | full | full |
+| `sparse_gate+up` | `x @ W_gate_sparse.T` | `x @ W_up_sparse.T` | full | full |
+| `zero_cold` | 0 | 0 | full | full |
+
+Routing for all three: `top-k(|x @ W_gate_sparse.T|)`.  Down projection always
+full precision.  W_gate_sparse and W_up_sparse both use kr=0.5, 300 Adam ft steps
+(same `build_sparse` function, matching target activations for each projection).
+
+### Results (granite-4.2-3b, all 40 layers, 500 prefill tokens)
+
+#### Strict and thermal perturbation (%)
+
+| Scheme | Strict% | Thermal @T=0.7 | Thermal @T=1.0 | Mean gap (perturbed) |
+|---|---|---|---|---|
+| sparse_gate_only @20% | **13.4%** | **6.6%** | **5.6%** | 1.06 logits |
+| sparse_gate+up @20% | 21.2% | 9.4% | 7.2% | 1.11 logits |
+| **zero_cold @20%** | **76.8%** | **73.4%** | **71.2%** | **5.32 logits** |
+| sparse_gate_only @30% | **12.0%** | **5.6%** | **4.8%** | 1.08 logits |
+| sparse_gate+up @30% | 18.4% | 8.6% | 7.0% | 1.05 logits |
+| **zero_cold @30%** | **63.0%** | **54.8%** | **52.4%** | **2.97 logits** |
+| sparse_gate_only @50% | 13.2% | 5.4% | 4.4% | 0.83 logits |
+| sparse_gate+up @50% | 14.8% | 6.0% | 4.8% | 0.81 logits |
+| **zero_cold @50%** | **33.6%** | **24.8%** | **22.2%** | **1.83 logits** |
+
+#### Perturbation reduction strict → thermal
+
+| Scheme | Strict | Thermal @0.7 | Δ@0.7 | Thermal @1.0 | Δ@1.0 |
+|---|---|---|---|---|---|
+| sparse_gate_only @20% | 13.4% | 6.6% | −6.8 pp | 5.6% | −7.8 pp |
+| sparse_gate+up @20% | 21.2% | 9.4% | −11.8 pp | 7.2% | −14.0 pp |
+| zero_cold @20% | 76.8% | 73.4% | −3.4 pp | 71.2% | −5.6 pp |
+| sparse_gate_only @30% | 12.0% | 5.6% | −6.4 pp | 4.8% | −7.2 pp |
+| sparse_gate+up @30% | 18.4% | 8.6% | −9.8 pp | 7.0% | −11.4 pp |
+| zero_cold @30% | 63.0% | 54.8% | −8.2 pp | 52.4% | −10.6 pp |
+
+### Key findings
+
+**Zero cold is catastrophically hard — not a soft error.**  Omitting cold channels
+(feeding zero to the down projection) gives 76.8% strict perturbation at 20% hot,
+and only 3.4 pp is forgiven at T=0.7 (73.4% thermal).  The mean logit gap among
+perturbed tokens is **5.32 logits** — the model is extremely confident in the wrong
+answer.  This is a structural error: SiLU(0)=0 eliminates the cold SwiGLU
+contribution entirely, but those ~80% cold channels carry substantial signal.
+Cold channels must retain *some* approximation (even a poor one); zeroing them is
+much worse than any approximate scheme tested.
+
+Even at 50% hot (only 50% zeroed), zero_cold gives 33.6% strict / 22.2% thermal
+perturbation — worse than any other scheme at any hot fraction.
+
+**Sparse up cold is worse than full-precision up, but soft errors.**
+`sparse_gate+up` is 7.8 pp worse than `sparse_gate_only` on the strict metric
+at 20% hot (21.2% vs 13.4%), but the thermal gap shrinks considerably:
+the mean gap for `sparse_gate+up` (1.11 logits) is only slightly larger than
+`sparse_gate_only` (1.06 logits).  At T=0.7 the gap is 2.8 pp (9.4% vs 6.6%),
+and at T=1.0 it is 1.6 pp (7.2% vs 5.6%).  These are soft errors — the sparse
+up approximation degrades the cold channel values but not catastrophically.
+
+The reason sparse up hurts more than sparse gate: the exp32 routing quality
+analysis shows that F1≈0.902 for sparse gate routing.  The cold gate channels are
+the ones the model *correctly identified as low-importance*, so their gate error
+(cold gate × sparse up) is penalised by SiLU which suppresses near-zero gate
+values.  But sparse up errors on cold channels are **not** suppressed by SiLU
+since up appears *after* the SiLU nonlinearity — they propagate directly.
+
+**Sparse_gate_only @30% hot is the sweet spot for the target regime.**
+
+| Scheme | Strict% | Thermal @T=0.7 | Thermal @T=1.0 |
+|---|---|---|---|
+| sparse_gate_only @30% | **12.0%** | **5.6%** | **4.8%** |
+| sparse_gate+up @30% | 18.4% | 8.6% | 7.0% |
+| FP8-equivalent | ~3–5% | ~2–4% | ~2–4% |
+| NVFP4-equivalent | ~10–20% | ~8–16% | ~8–16% |
+
+At 30% hot with sparse gate only: strict perturbation 12.0% (NVFP4 lower bound),
+thermal@T=1.0 **4.8%** (FP8 range).  This is the best operating point in the
+20–30% hot target regime across both metrics.
+
+**Note: this run's sparse_gate_only numbers differ slightly from exp33.**
+Exp33's `sparse_gate_only @20%` gave strict=0.850 (15.0% perturbation), while
+exp35 gives 13.4%.  This is expected: exp35 rebuilds the sparse W_gate weights
+independently via the HF safetensors path (no vLLM fused weight) while exp33
+used the vLLM fused gate_up_proj[:I].  The two are the same underlying
+weights but the Adam fine-tune has random mini-batch sampling, so results vary
+by ~1–2 pp between runs.
+
+### Conclusion
+
+**Keep W_up full precision for cold channels.**  Sparse up cold adds 6–8 pp
+strict perturbation and 2–3 pp thermal perturbation at 20–30% hot with no
+compensating benefit — it is simply a worse approximation for cold channels.
+The finding from exp20 (W_up must stay full for cold) is confirmed in the sparse
+regime: sparse gate cold is fine (signal suppressed by SiLU); sparse up cold is
+not (error propagates directly through the bilinear product).
+
+**Zero cold is a hard structural error, not a soft approximation miss.**
+Mean gap 5.32 logits (20% hot) is ~7–8× larger than sparse approximation schemes
+(~0.8–1.1 logits) and barely forgiven thermally.  Cold channels must contribute
+their approximate values — the residual signal from SiLU(cold_gate)×up_full is
+load-bearing even for nominally "inactive" channels.
+
+**Recommended scheme going forward:** `sparse_gate_only`, kr=0.5+ft, hot=25–30%.
+- Strict: ~12–14% (NVFP4 lower bound)
+- Thermal @T=1.0: ~4.8–5.6% (FP8 range)
+- W_up: always full precision
+- W_down: always full precision
+- Cold gate: x @ W_sparse.T (free, reuses routing GEMM)
