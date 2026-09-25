@@ -47,6 +47,7 @@
 | 35 | Sparse up projection + zero-cold comparison; target regime 20–30% hot; strict + thermal metric | gate routing: top-k(\|x @ W_gate_sparse.T\|); cold gate = W_gate_sparse, cold up = W_up_sparse or zero; up always full for hot | sparse_gate+up @20%: strict=21.2%, **thermal@0.7=9.4%**; sparse_gate+up @30%: strict=18.4%, **thermal@0.7=8.6%**; zero_cold @20%: strict=76.8%, thermal=73.4% | Sparse up cold is worse than full-precision up (exp33): +7.8 pp strict at 20% hot; however thermal gap is narrower (+2.8 pp). Zero cold is catastrophically hard (gap 5.3 logits @20%): omitting cold channels is a hard error, not recoverable thermally. Sparse_gate_only @30% hot is the new sweet spot: strict=12.0%, thermal@0.7=5.6%, thermal@1.0=4.8% — FP8-equivalent at T=1.0 at the target hot fraction |
 | 36 | E5M3 B=8 cold up with sparse gate routing — e2e strict + thermal | cold gate = W_gate_sparse; cold up = E5M3 B=8 sign+scale; hot = full precision; down = full | @20% hot: strict=38.6%, **thermal@0.7=30.6%**; @30%: strict=30.0%, thermal@0.7=23.4%; @50%: strict=19.8%, thermal=10.8% | E5M3 cold up is far worse than full-precision up at sparse hot fractions (20–30%): +25 pp strict / +24 pp thermal at 20% hot; mean gap ~2.0 logits (hard errors). Only recovers at 50% hot (+6.6 pp strict, thermal@1.0=8.2%). W_up must stay full precision for cold channels regardless of up encoding scheme — confirming exp20 and exp35 at the cold-up encoding level |
 | 37 | 3bpw cold up: 2-bit/weight, 2 E5M3 scales per B=16 block, TARE-optimal EM, sparse gate routing — e2e strict + thermal | cold up = ±{s_lo,s_hi} per B=16, E5M3 quantised scales; hot = full; down = full | @20%: strict=24.4%, **thermal@0.7=15.6%**; @30%: strict=22.6%, thermal@0.7=13.2%; @50%: strict=16.8%, thermal@0.7=8.4% | 3bpw halves the penalty vs 1bpw E5M3 (~11 pp strict penalty vs ~22 pp at 20–30% hot), but still +7–9 pp thermal over full-precision up. Gap metric drops from 2.0 → 1.39 logits (softer errors) but not yet matching full-prec (1.06). At 50% hot, 3bpw is within 3 pp strict / 3 pp thermal of full-prec up. W_up cold must still be full precision for the 20–30% hot target regime |
+| 38 | 3bpw static encoding quality check — no routing, uniform encoding of individual matrices and combinations | gate=3bpw (no routing); gate+up=3bpw; gate+down=3bpw; all=3bpw | gate only: strict=49%, **thermal@0.7=46.2%**, gap=3.5L; gate+up: strict=96.4%, gap=8.5L; gate+down: strict=88.4%, gap=8.1L; all: strict=99.8%, gap=10.6L | 3bpw gate alone is already catastrophic (49% strict) without routing; gate+up compound to 96% perturbation. Confirms that hot/cold routing is not merely helpful but structurally essential — 3bpw encoding applied globally destroys output quality. Each additional encoded matrix compounds error multiplicatively: gate×up SwiGLU product doubles the noise, down projection broadcasts it over all output dims |
 
 
 ## Core idea
@@ -3995,3 +3996,101 @@ that cannot be eliminated by better quantisation of W_up.
 cold gate: x @ W_gate_sparse.T   (sparse approx — free)
 cold up:   x @ W_up_full.T       (full precision — non-negotiable)
 ```
+
+
+## Experiment 38 — 3bpw static encoding quality check (no routing)
+
+**Goal:** Quantify the standalone quality cost of 3bpw encoding on each MLP
+matrix independently and in combination, with **no hot/cold routing**.  Every
+channel is approximated uniformly.  This answers whether 3bpw is a viable
+global quantisation scheme for MLP weights, and establishes how errors
+compound when multiple matrices are encoded simultaneously.
+
+**Setup:** Same 3bpw encoding as exp37 (2-level TARE-optimal E5M3 B=16), same
+calibration set (8 prompts, 500 prefill tokens), same strict + thermal metrics.
+No routing, no sparse weights — purely static weight approximation.
+
+### Conditions
+
+| Condition | W_gate | W_up | W_down |
+|---|---|---|---|
+| gate only | 3bpw | full | full |
+| gate + up | 3bpw | 3bpw | full |
+| gate + down | 3bpw | full | 3bpw |
+| gate + up + down | 3bpw | 3bpw | 3bpw |
+
+Note: `gate only` matches the "cold" contribution from exp33/34 if all channels
+were cold — i.e. if hot_frac=0 in the routing experiments.
+
+### Results
+
+| Condition | Strict | Thermal@0.7 | Thermal@1.0 | Mean gap |
+|---|---|---|---|---|
+| gate only | 49.0% | 46.2% | 44.8% | 3.53 L |
+| gate + up | 96.4% | 94.6% | 93.6% | 8.48 L |
+| gate + down | 88.4% | 86.0% | 85.6% | 8.09 L |
+| gate + up + down | 99.8% | 99.2% | 99.0% | 10.60 L |
+
+### Analysis
+
+**Gate alone (49% strict) confirms routing is mandatory.**  Even the best
+available 3bpw encoding of W_gate destroys half the top-1 predictions when
+applied globally.  In the hot/cold routing scheme (exp33–37), only cold
+channels use the sparse/encoded gate — and those errors are suppressed by
+SiLU because cold gate values are near-zero.  Remove the routing and the
+suppression disappears: every large gate activation is now approximated,
+introducing large pre-SiLU errors that propagate directly.
+
+The gap of 3.53 logits for gate alone (vs 1.06 logits in exp34 `sparse gate
+only @30% hot`) quantifies the routing benefit: routing reduces the mean error
+gap by ~2.5 logits by concentrating approximation on channels where SiLU
+naturally suppresses the error.
+
+**Gate + up (96.4% strict) is a qualitative step change.**  Encoding both gate
+and up projects their individual errors into the SwiGLU product:
+
+```
+SiLU(gate_enc) × up_enc ≈ SiLU(gate + δg) × (up + δu)
+                         ≈ SiLU(gate)×up + SiLU(gate)×δu + SiLU'(gate)×δg×up + ...
+```
+
+The cross-terms are not suppressed by any structural property when applied
+globally.  The gap jumps from 3.5 L to 8.5 L — the two error sources multiply
+rather than add, confirming the SwiGLU noise-multiplication effect seen in
+exp20.
+
+**Gate + down (88.4% strict) is nearly as bad.**  Encoding W_down distributes
+the gate error over all hidden dimensions H=2560 during the down projection.
+Each output dimension accumulates O(I) approximation errors, producing a
+biased output norm shift that is large enough to flip the majority of top-1
+tokens.
+
+**All three matrices (99.8% strict) is complete model collapse.**  The mean gap
+of 10.6 logits means the perturbed model assigns nearly all probability mass to
+wrong tokens — qualitatively different from quantisation noise, closer to
+random output.
+
+### Comparison with hot/cold routing
+
+The routing experiments (exp33–37) operate at 20–30% hot fraction, meaning
+70–80% of channels are handled by encoded/sparse weights.  The fact that
+`sparse gate only @30% hot` achieves 12% strict perturbation vs `gate only
+(no routing)` at 49% is striking: routing recovers 37 pp of quality simply by
+choosing *which* channels to approximate.
+
+This confirms the architecture conclusion from exp33–37:
+
+```
+hot/cold routing is the load-bearing mechanism — not the encoding quality.
+3bpw (or any encoding) can only be tolerated in the cold regime where SiLU
+suppresses gate errors toward zero. Global application is non-viable.
+```
+
+### Conclusion
+
+3bpw encoding applied globally is catastrophic across all matrix combinations.
+The encoding quality is not the bottleneck — the absence of routing is.  This
+experiment provides a useful lower bound: any viable compression scheme for
+MLP weights in this architecture requires structured routing (hot/cold split)
+to remain in the FP8-equivalent regime.  Static global quantisation of MLP
+weights to 3bpw is not competitive with INT8/FP8 global schemes.
