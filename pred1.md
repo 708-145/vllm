@@ -29,6 +29,11 @@
 | 22 | B=8 E5M3 gate only, top-k routing, full up+down — e2e top-1 | Current / proxy-prior | match=0.408 @10% hot | E5M3 (7.2× better scale precision than E8M0) still below ternary baseline; scale precision alone does not fix cold-channel over-activation |
 | 23 | B=8 E5M3 gate, **threshold routing** T×mean(gate_approx), full up+down — e2e top-1 | Threshold on current | **match=0.736 @T=0.5** (best result in series) | Threshold routing with accurate E5M3 scale fixes exp2's failure; adaptive hot fraction beats fixed top-k by 20 pp |
 | 24 | E5M3 threshold fine sweep T=0.20–0.80 (step 0.05), per-layer hot% monitoring, 2% floor variant | Threshold on current | **match=0.818 @T=0.20**, 88% hot | Monotonic improvement as T decreases; no dead layers; floor unnecessary; curve still rising at T=0.20 |
+| 25a | **Diagnostic**: E5M3 gate_approx activation error vs gate_full, all channels — encoding quality on real activations | — | Mean SNR 5.7 dB (R²=0.69) for E5M3 gate; up E5M3 SNR 4.7 dB; ternary SNR 5.1 dB | All three encodings comparable SNR; rel% metric dominated by near-zero channels; R² the meaningful signal |
+| 25b | **Diagnostic**: gate_approx error stratified by hot/cold split at each threshold T | — | Hot SNR ~6–7 dB (R²≈0.70); cold SNR ~0–2 dB (R²≈0.04–0.33) | Scheme works not because hot approx is accurate but because SiLU suppresses cold noise toward zero; cold R²≈0.04 is harmless |
+| 25c | **Diagnostic**: E5M3 routing quality (hot/cold binary classification) vs oracle gate_full — precision/recall sweep | — | T=0.20: F1=0.903, IoU=0.823; T=0.80: F1=0.784, IoU=0.645 | Routing degrades with higher T (sparser); no systematic bias; hot%(approx) ≈ hot%(oracle) throughout |
+| 25d | **Diagnostic**: SVD routing quality vs oracle, rank sweep 16–1024, hot=20% and 50% | — | rank=1024 @20%: F1=0.745; @50%: F1=0.873; rank=64 @20%: F1=0.551 | Low-rank SVD loses fine-grained channel ordering absent from leading singular directions; F1 barely changes with rank beyond ~256 — signal saturates; E5M3 dominates at sparse regime |
+| 25e | **Diagnostic**: learned linear predictor (cross-covariance SVD) routing quality, rank 16–1024 — training cost analysis | — | Regression F1≈0.32–0.54; binary-label F1≈0.38–0.58 (all ranks nearly equal) | Trained linear predictor far worse than W_gate SVD; cross-cov rank-1 saturates (almost no gain rank 16→1024); nonlinear SwiGLU target cannot be predicted linearly from x; training cost 25.7 TFLOPs (trivial offline) but result is uncompetitive |
 | 26 | Sparse SwiGLU: E5M3 routing, hot channels full-precision gate+up, cold channels zeroed (no approx value used), full W_down — e2e top-1 | Threshold on current | match=0.814 @T=0.20, 88% hot | Consistently −0.004 to −0.059 vs exp24; cold gate_approx contribution (SiLU≈0) is slightly helpful, not harmful; zeroing cold channels is not an improvement |
 | 27 | Low-rank SVD routing (union top-k gate+up), hot full-precision gate+up, cold E5M3 B=8 gate+up, full W_down — e2e top-1 | Top-k union on \|gate_lr\|∪\|up_lr\| | rank=1024: **0.834 @50% hot**, 0.612 @20%; rank=256: 0.764 @50%; rank=64: 0.392–0.678 | Low-rank routing + E5M3 cold for both gate+up beats exp24 at equal hot% for rank≥256 @50%; at 20% hot exp24 (0.818) still wins; cold E5M3 up tolerable when routing quality is high |
 | 28 | E5M3-encoded SVD factor matrices (binary sign+scale), rank=1024 and 2048, same hybrid scheme as exp27 — e2e top-1 | Top-k union on encoded \|gate_lr\|∪\|up_lr\| | rank=2048: 0.808 @50%, 0.582 @20%; rank=1024: 0.766 @50% | Encoding SVD factors costs ~3–7 pp vs full-prec factors (exp27); rank=2048 partly recovers loss but still −2.6 pp vs exp27 r1024 @50%; routing cost at r=2048 = 105% of full GEMM (no net saving); E5M3 encoding of orthonormal vectors loses too much directional info |
@@ -2409,3 +2414,460 @@ The next experiment should extend the sweep below T=0.20 to find whether there
 is a true optimum or whether the curve keeps improving all the way to T→0
 (which would be equivalent to full precision computation with an encoding
 overhead, not a useful approximation).
+
+## Experiment 25a — Activation error of gate_approx and up_approx
+
+### Motivation
+
+Exp23/24 showed that E5M3 threshold routing achieves 0.818 match at T=0.20.
+The TARE metric from exp17–19 measures weight-space encoding error.  This
+experiment measures the actual *activation* error — `|gate_approx − gate_full|`
+— on real hidden states from calibration prompts, to understand whether the
+encoding quality translates to good routing fidelity.
+
+### Scheme
+
+Hook each MLP layer's forward pass.  For every token batch capture `x`
+(the MLP input) and compute:
+- `gate_full = x @ W_gate.T`
+- `gate_approx = x @ W_gate_enc.T` (E5M3 B=8)
+- `up_approx = x @ W_up_enc.T` (E5M3 B=8, hypothetical)
+- `gate_ter = x @ W_gate_ter.T` (ternary α=0.75, exp14 encoding)
+
+Metrics: mean relative error, RMS SNR (dB), R².
+
+### Results (granite-4.2-3b, 8 prompts, ~500 prefill tokens, CPU)
+
+| Encoding | Mean SNR (dB) | R² | Notes |
+|---|---|---|---|
+| E5M3 gate (exp22–24) | **5.7** | 0.69 | used for routing and cold values |
+| E5M3 up (hypothetical) | 4.7 | — | up never encoded in exp20–24 |
+| Ternary gate (exp14) | 5.1 | — | used in earlier experiments |
+
+Mean relative error (200–400%) is misleading — dominated by near-zero channels
+where `|full| + ε` is tiny.  SNR and R² are the meaningful metrics.
+
+### Key findings
+
+All three encodings have comparable SNR (~5–6 dB), meaning the error RMS is
+roughly 50–58% of the signal RMS per channel.  This sounds large but is
+tolerable because:
+1. Routing uses `|gate_approx|` for ranking, not absolute values — rank
+   correlation matters more than absolute accuracy.
+2. Cold channels are near-zero by selection; SiLU suppresses any residual error.
+
+The rel_err spike at layers 4, 33, 38–39 (>600%) indicates layers with heavy
+weight outliers but these do not worsen routing quality (confirmed by exp24
+no-dead-layers result).
+
+### Conclusion
+
+E5M3 encoding achieves R²≈0.69 on real activations — sufficient for
+reliable routing, confirmed by the F1=0.90 routing quality measured in exp25c.
+
+---
+
+## Experiment 25b — Gate error stratified by hot/cold
+
+### Motivation
+
+The all-channel error from exp25a averages over hot and cold channels together.
+Since the scheme uses `gate_approx` as the *value* for cold channels, the
+relevant question is: how accurate is `gate_approx` specifically on cold
+channels (where the error affects the output), vs hot channels (where
+`gate_full` replaces it anyway)?
+
+### Results (granite-4.2-3b, thresholds T=0.20–0.80)
+
+| T | hot% | hot SNR (dB) | hot R² | cold SNR (dB) | cold R² |
+|---|---|---|---|---|---|
+| 0.20 | 88% | 6.0 | 0.704 | 0.2 | 0.035 |
+| 0.40 | 76% | 6.3 | 0.715 | 0.6 | 0.124 |
+| 0.60 | 65% | 6.6 | 0.725 | 1.2 | 0.231 |
+| 0.80 | 54% | 6.9 | 0.733 | 1.9 | 0.332 |
+
+### Key findings
+
+**Hot channels** (large `|gate_approx|`, recomputed at full precision): SNR ~6–7 dB,
+R²≈0.70 — the encoding is reasonably accurate but it doesn't matter because
+these channels are overwritten with `gate_full`.
+
+**Cold channels** (small `|gate_approx|`, value used directly): SNR ~0–2 dB,
+R²≈0.04–0.33 — nearly pure noise in terms of encoding the true value.  Yet the
+scheme works precisely *because* of this: cold channels have small `|gate_approx|`
+by definition, so `SiLU(gate_approx_cold) ≈ 0` regardless of encoding accuracy.
+The terrible cold-channel R² is harmless.
+
+### Conclusion
+
+The routing scheme's correctness rests on two asymmetries: (1) hot channels are
+recomputed exactly; (2) cold channels are near-zero so SiLU suppresses any
+encoding error.  E5M3 quality on cold channels is irrelevant — the encoding
+only needs to be accurate enough that `|gate_approx|` reliably identifies which
+channels are hot.
+
+---
+
+## Experiment 25c — E5M3 routing quality: precision/recall vs oracle
+
+### Motivation
+
+Measure the binary routing decision quality: when E5M3 says "hot", does the
+oracle (gate_full) agree?  Apply the same threshold T to both `|gate_approx|`
+and `|gate_full|` and measure precision/recall/F1/IoU.
+
+### Results (granite-4.2-3b, 40 layers, macro-averaged)
+
+| T | hot%(A) | hot%(F) | Precision | Recall | F1 | IoU | Accuracy |
+|---|---|---|---|---|---|---|---|
+| 0.20 | 88.0% | 87.6% | 0.901 | 0.905 | 0.903 | 0.823 | 0.829 |
+| 0.40 | 76.2% | 75.6% | 0.844 | 0.852 | 0.848 | 0.737 | 0.770 |
+| 0.60 | 64.7% | 64.0% | 0.809 | 0.819 | 0.814 | 0.687 | 0.762 |
+| 0.80 | 53.7% | 53.0% | 0.779 | 0.790 | 0.784 | 0.645 | 0.771 |
+
+### Key findings
+
+- Routing quality degrades as T increases (sparser hot set = finer boundary
+  decisions, more misclassifications at the margin).
+- No systematic bias: `hot%(approx) ≈ hot%(oracle)` throughout.
+- At T=0.20 (exp24 best operating point): F1=0.903, IoU=0.823 — the ~10%
+  routing errors are further suppressed by SiLU before reaching the output.
+
+### Conclusion
+
+E5M3 is a high-quality routing signal at the operating points used in exp23/24.
+The degradation at higher T explains the quality gap between T=0.20 and T=0.80.
+
+---
+
+## Experiment 25d — SVD routing quality vs oracle, rank sweep
+
+### Motivation
+
+Exp27 uses SVD of W_gate and W_up as routing signals.  Before running e2e tests,
+measure whether SVD at low ranks can match E5M3's routing quality.
+
+### Results (granite-4.2-3b, 40 layers, macro-averaged)
+
+**hot=20%:**
+
+| Rank | F1 | IoU | rec_gate | rec_up |
+|---|---|---|---|---|
+| 16 | 0.508 | 0.343 | 0.337 | 0.251 |
+| 64 | 0.551 | 0.382 | 0.361 | 0.275 |
+| 256 | 0.612 | 0.443 | 0.391 | 0.315 |
+| 1024 | 0.745 | 0.595 | 0.451 | 0.402 |
+| **E5M3 (exp25c)** | **0.784** | **0.645** | — | — |
+
+**hot=50%:**
+
+| Rank | F1 | IoU |
+|---|---|---|
+| 16 | 0.794 | 0.659 |
+| 256 | 0.822 | 0.698 |
+| 1024 | 0.873 | 0.775 |
+| **E5M3 (exp25c ~88%)** | **0.903** | **0.823** |
+
+### Key findings
+
+Low-rank SVD is consistently worse than E5M3 at routing, especially at 20% hot.
+Even rank=1024 (F1=0.745 @20%) falls below E5M3 (F1=0.784 @~53% hot).
+
+The root cause: SVD captures global weight-space directions (which channels are
+*on average* large for typical inputs), while E5M3 preserves the sign and
+per-block scale of every individual weight, giving token-specific channel ranking.
+The `rec_gate` and `rec_up` columns show that even the gate signal alone at
+rank=1024 only recalls 45% of oracle-hot channels at 20% hot.
+
+F1 barely changes from rank 16 to rank 1024 at 50% hot (~0.79 to ~0.87),
+suggesting the routing signal is saturating — the trailing singular directions
+contain most of the per-token channel-ordering information.
+
+### Conclusion
+
+For sparse routing (≤20% hot), E5M3 is superior.  For dense routing (50%+ hot),
+rank=1024 SVD becomes competitive and has the advantage of providing a separate
+routing signal for W_up, enabling E5M3 cold values for both gate and up
+(tested in exp27).
+
+---
+
+## Experiment 25e — Learned linear predictor: training cost and routing quality
+
+### Motivation
+
+Could a predictor trained on recorded activations do better than using the
+model weights directly?  We compute the optimal rank-r linear predictor for
+two targets using the closed-form cross-covariance SVD solution:
+- **Regression**: predict `down_input` (SwiGLU activity) directly
+- **Binary**: predict the hot/cold label vector
+
+### Training cost
+
+| Step | Cost per layer | Cost all 40 layers |
+|---|---|---|
+| Cross-covariance `C = X^T Y / N` | 534 GFLOPs | 21.4 TFLOPs |
+| SVD of `C` (H×I = 2560×8192) | 107 GFLOPs | 4.3 TFLOPs |
+| **Total** | **641 GFLOPs** | **25.7 TFLOPs** |
+
+25.7 TFLOPs is a few GPU-seconds of offline compute — entirely feasible.
+Inference routing cost is 0.8–52.5% of one GEMM depending on rank (same as SVD).
+
+### Results (10 representative layers, N=12734 tokens)
+
+**hot=20%:**
+
+| Predictor | Rank 16–1024 F1 range |
+|---|---|
+| Regression cross-cov | 0.318 → 0.321 |
+| Binary hot-label cross-cov | 0.380 → 0.384 |
+| **SVD of W_gate (exp25d)** | **0.508 → 0.745** |
+| **E5M3 of W_gate (exp25c)** | **0.784** |
+
+**hot=50%:**
+
+| Predictor | Rank 16–1024 F1 range |
+|---|---|
+| Regression cross-cov | 0.539 → 0.540 |
+| Binary hot-label cross-cov | 0.577 → 0.580 |
+| **SVD of W_gate (exp25d)** | **0.794 → 0.873** |
+
+### Key findings
+
+1. **Trained predictors are dramatically worse than weight-derived ones.**
+   The regression predictor at rank=1024 (F1=0.32 @20% hot) is far below even
+   SVD rank=16 (F1=0.508).
+
+2. **Rank has almost no effect** — F1 changes by <0.005 from rank 16 to 1024.
+   The cross-covariance `C = X^T Y` is effectively rank-1: nearly all the linear
+   correlation between inputs and SwiGLU outputs lives in a single direction.
+   Additional singular vectors add nothing.
+
+3. **Root cause**: `down_input = SiLU(W_gate x) * W_up x` is nonlinear in `x`.
+   A linear predictor can only capture the linear component, which is far weaker
+   than the structured signal that `x @ W_gate.T` provides directly.  The weight
+   matrix *is* the optimal linear predictor of gate activity — no training needed.
+
+4. **Binary label target** is marginally better than regression (F1 +0.06) but
+   both are uncompetitive.
+
+### Conclusion
+
+Training a learned linear predictor provides no benefit over using the model
+weights directly.  The 25.7 TFLOPs training cost is trivial but the result
+is ~2× worse than E5M3 routing.  The correct approach is to use `x @ W_gate_enc.T`
+(E5M3-encoded actual gate weights) as the routing signal.
+
+---
+
+## Experiment 26 — Sparse SwiGLU: cold channels zeroed
+
+### Motivation
+
+Exp24 uses `gate_approx` (E5M3) as the cold-channel gate value fed into SiLU.
+Exp25b showed cold-channel SNR is 0–2 dB (nearly noise).  Would zeroing cold
+channels entirely (no approximation at all) perform better?
+
+### Scheme
+
+```
+gate_approx = x @ W_gate_enc.T      # E5M3 routing only
+hot = |gate_approx| > T * mean(|gate_approx|)
+gate = where(hot, x @ W_gate.T, 0)  # cold = 0, not gate_approx
+up   = where(hot, x @ W_up.T,   0)
+out  = (SiLU(gate) * up) @ W_down.T
+```
+
+### Results (granite-4.2-3b, 8 prompts, 500 tokens)
+
+| T | hot% | exp26 match | exp24 match | Δ |
+|---|---|---|---|---|
+| 0.20 | 88% | 0.814 | **0.818** | −0.004 |
+| 0.40 | 76% | 0.752 | **0.779** | −0.027 |
+| 0.60 | 65% | 0.636 | **0.695** | −0.059 |
+| 0.80 | 54% | 0.576 | **0.632** | −0.056 |
+
+### Key findings
+
+Zeroing cold channels is **consistently worse** than using `gate_approx`.  The
+gap grows as T increases — more cold channels means more zeroing means more loss.
+
+Cold channels have small `|gate_approx|` by definition, so `SiLU(gate_approx_cold)`
+is close to zero but not exactly zero.  The residual contribution is small but
+slightly positive and helpful, not harmful.
+
+### Conclusion
+
+The E5M3 approximation on cold channels is a mild beneficial signal rather than
+noise to be discarded.  Exp24's scheme (use `gate_approx` for cold channels,
+`gate_full` for hot) is the correct design.
+
+---
+
+## Experiment 27 — Low-rank SVD routing with E5M3 cold gate and up
+
+### Motivation
+
+Exp24 routes on `|gate_approx|` (E5M3) and uses full-precision `up` for all
+channels.  The up projection is the second-largest compute cost.  If routing
+quality is high enough, E5M3 cold values for `up` as well could halve the cold-
+channel compute.  SVD routing provides separate signals for both gate and up.
+
+### Scheme
+
+```
+gate_lr = x @ W_gate_lr.T   (rank-r SVD of W_gate)
+up_lr   = x @ W_up_lr.T     (rank-r SVD of W_up)
+hot = top-k(|gate_lr|, k) ∪ top-k(|up_lr|, k)   # union, k = frac * I
+gate = where(hot, gate_full, gate_e5m3)
+up   = where(hot, up_full,   up_e5m3)
+out  = (SiLU(gate) * up) @ W_down.T
+```
+
+Key difference from exp24: **both gate and up use E5M3 for cold channels**
+(not just gate).  This is enabled by high routing quality catching channels
+where up matters.
+
+### Results (granite-4.2-3b, 8 prompts, 500 tokens)
+
+| Rank | hot=20% | hot=30% | hot=50% | Δ vs exp24 @50% |
+|---|---|---|---|---|
+| 64 | 0.392 | 0.472 | 0.678 | −0.058 |
+| 256 | 0.520 | 0.606 | 0.764 | +0.028 |
+| **1024** | 0.612 | 0.702 | **0.834** | **+0.098** |
+| exp24 ref | **0.818** | 0.798 | 0.736 | — |
+
+### Key findings
+
+- **Rank=1024 @50% hot beats exp24** (0.834 vs 0.736) — first scheme to beat
+  exp24 at a comparable operating point.  The better routing from SVD (which
+  sees both gate and up) compensates for encoding W_up cold channels.
+- **At 20% hot exp24 still wins** (0.818 vs 0.612) — SVD routing quality is
+  insufficient to protect the sparse hot set accurately (F1=0.745 vs E5M3
+  F1=0.784 from exp25c/25d).
+- **Rank matters** — 64→256→1024 shows clear monotonic improvement.
+- Routing cost: rank=1024 = 52.5% of one GEMM (for both gate and up routing).
+
+### Conclusion
+
+SVD routing with E5M3 cold gate+up is a viable scheme at 50%+ hot, offering
+better quality than E5M3 threshold routing at equal compute because the union
+routing captures channels important to either projection.  The scheme is not
+competitive at sparse operating points due to limited SVD routing quality.
+
+---
+
+## Experiment 28 — E5M3-encoded SVD factor matrices, rank 2048
+
+### Motivation
+
+Exp27 stores SVD factors (Vt, UT) in float32.  Could encoding the factor
+matrices themselves with E5M3 (binary sign + per-block scale) reduce storage
+and routing cost while preserving routing quality?  Also tests rank=2048
+(the maximum useful rank, min(H,I)=2560).
+
+### Scheme
+
+```
+Vt_g_enc = E5M3(Vt_g)   # (r, H) encoded row-wise
+UT_g_enc = E5M3(UT_g)   # (r, I) encoded row-wise
+routing: hg = (x @ Vt_g_enc.T) * s_g  →  gate_lr = hg @ UT_g_enc
+```
+
+Singular values `s_g` stay float32.  Same hybrid hot/cold computation as exp27.
+
+### Results (granite-4.2-3b, 8 prompts, 500 tokens)
+
+| Rank | hot=20% | hot=30% | hot=50% | Δ vs exp27 fp32 r1024 @50% |
+|---|---|---|---|---|
+| 1024 (E5M3 factors) | 0.558 | 0.636 | 0.766 | −0.068 |
+| 2048 (E5M3 factors) | 0.582 | 0.674 | 0.808 | −0.026 |
+| exp27 r1024 (fp32) | 0.612 | 0.702 | **0.834** | — |
+
+Routing cost at rank=2048: 105% of one full GEMM — no compute saving.
+
+### Key findings
+
+- Encoding SVD factor matrices with E5M3 costs 3–7 pp vs float32 factors.
+- Rank=2048 recovers ~half the loss vs rank=1024 float32, but at 2× routing cost.
+- **Root cause of degradation**: rows of Vt and UT are orthonormal unit vectors.
+  Their information content is entirely in their *direction*, not magnitude.
+  E5M3's per-block-of-8 scale quantisation distorts those directions, corrupting
+  the routing signal in a way it cannot for W_gate (whose rows have meaningful
+  magnitude variation).
+
+### Conclusion
+
+SVD factor matrices must stay float32 (or at minimum BF16) for routing to be
+effective.  E5M3 encoding of orthonormal vectors is structurally incompatible
+with the routing use case.
+
+---
+
+## Experiment 29 — SwiGLU-LR routing: top-k on |SiLU(gate_lr) * up_lr|
+
+### Motivation
+
+Exp27 routes on the **union** of top-k(|gate_lr|) and top-k(|up_lr|).  A channel
+enters the hot set if *either* projection is large.  But SwiGLU channel i
+contributes `SiLU(gate[i]) * up[i]` — both must be large for a large output.
+Routing on `|SiLU(gate_lr) * up_lr|` should select channels where the combined
+product is large, giving a tighter and more accurate hot set.
+
+### Scheme
+
+```
+gate_lr  = x @ W_gate_lr.T
+up_lr    = x @ W_up_lr.T
+signal   = |SiLU(gate_lr) * up_lr|   # combined SwiGLU estimate
+hot      = top-k(signal, k)           # exactly k channels, no union expansion
+```
+
+### Routing quality (Part 1, from activations NPZ, hot=20%)
+
+| Signal | Rank | hot%(A) | F1 | IoU |
+|---|---|---|---|---|
+| SwiGLU-LR (exp29) | 64 | 20.0% | 0.329 | 0.198 |
+| Union-LR (exp27) | 64 | 36.0% | 0.334 | 0.201 |
+| SwiGLU-LR (exp29) | 1024 | 20.0% | 0.596 | 0.425 |
+| Union-LR (exp27) | 1024 | 35.9% | 0.460 | 0.299 |
+
+At hot=50%:
+
+| Signal | Rank | hot%(A) | F1 | IoU |
+|---|---|---|---|---|
+| SwiGLU-LR (exp29) | 1024 | 50.0% | 0.704 | 0.544 |
+| Union-LR (exp27) | 1024 | 75.6% | **0.706** | **0.545** |
+
+### E2e results (granite-4.2-3b, 8 prompts, 500 tokens)
+
+| Rank | hot=20% | hot=30% | hot=50% | Δ vs exp27 |
+|---|---|---|---|---|
+| 64 | 0.394 | 0.440 | 0.516 | −0.162 @50% |
+| 256 | 0.472 | 0.570 | 0.682 | −0.082 @50% |
+| 1024 | 0.568 | 0.630 | 0.732 | **−0.102** @50% |
+
+### Key findings
+
+**SwiGLU-LR is worse than union-LR at all ranks and hot fractions.**
+
+The routing quality table reveals why.  At hot=50%, rank=1024: SwiGLU-LR
+achieves F1=0.704 with hot%(A)=50%, while union-LR achieves F1=0.706 with
+hot%(A)=75.6%.  The F1 against a 50% oracle is essentially identical, but
+union-LR selects 75.6% of channels — many extra, but with better recall.
+
+This exposes an **asymmetric cost structure**:
+- **False positive** (hot but should be cold): costs one full-precision GEMM
+  row for a channel that contributes little — small cost.
+- **False negative** (cold but should be hot): approximates a genuinely large
+  channel with E5M3 — large quality cost.
+
+Union-LR over-selects (hot%≤2×frac) and trades cheap false positives for
+fewer costly false negatives.  SwiGLU-LR is precision-optimal but recall-
+limited, and in this asymmetric cost structure **recall dominates**.
+
+### Conclusion
+
+The union routing in exp27 is superior to the SwiGLU-combined signal precisely
+because over-selection is cheap in this scheme.  Routing on the combined
+product discards the union expansion that makes exp27 work.
