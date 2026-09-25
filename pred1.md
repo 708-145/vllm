@@ -56,9 +56,11 @@
 | 44 | E5M0 vs E8M0 block scale + scale distribution — MXFP4/5/6-E2Mx, B=32 | E8M0 (range 2^±127) vs E5M0 (range 2^±15); element formats unchanged; plus full scale exponent histogram | **Δ = 0.0 pp everywhere**; scales span only e∈[−12, −3], 10 distinct values; 66% of blocks use e∈{−8,−7}; 4 bits would cover the full observed range | E8M0 range entirely unused. All 78.6M blocks have e∈[−12, −3]. Distribution is bimodal: e=−8 (32.5%) and e=−7 (33.6%) account for 66% of all blocks; e∈[−10,−7] covers 99.3%. A 4-bit scale (16 values) or even E4M0 would be sufficient for this model. |
 | 44b | LUT-based mixed-mode scale scheme: bit-cost analysis — no new inference; analytical follow-on to exp44 | Scale distribution from exp44; 3 modes: ≤2 scales→1 bit/block, 3–4 scales→2 bits/block, ≥5 scales→4 bits/block; 2-bit per-channel mode flag | **1.461 bits/block** actual overhead (1.266 index + 0.194 LUT amortisation); mode-0: 76.6% of channels, mode-1: 22.9%, mode-2: 0.4%; MXFP6-E2M3 total = **6.046 bpw** vs 6.250 flat | E8M0 scale overhead reduced 5.5× (8.00 → 1.46 bits/block), saving 0.204 bpw. Mode-2's 16-entry LUT is over-provisioned — 2 bits (4 entries) covers 99.6% of channels. User estimate of ~1.2 bits/block was close; actual 1.46 driven by 23% mode-1 channels (2 bits/block each). |
 | 44c | LUT scheme applied to MXFP5-E2M2 and MXFP4-E2M1 — analytical extension; no new inference | Same LUT channel assignment (format-independent); only element bpw changes: MXFP4=4 bits/weight, MXFP5=5, MXFP6=6; scale overhead = 1.461/32 = **0.04566 bpw** in all cases | MXFP4+LUT: **4.046 bpw** (saving 0.204 bpw / 4.8%); MXFP5+LUT: **5.046 bpw** (3.9%); MXFP6+LUT: **6.046 bpw** (3.3%). Quality unchanged: LUT is lossless scale re-encoding. MLP total: MXFP5+LUT=1.59 GB, MXFP4+LUT=1.27 GB vs BF16 5.03 GB | Absolute scale saving (0.204 bpw) is identical across all E2Mx formats — it is purely a scale-field reduction. MXFP5+LUT (5.046 bpw, thermal@0.7=3.6%) is the practical sweet spot: FP8-equivalent quality at 3.17× BF16 compression. MXFP4+LUT buys another 0.77 GB at the cost of crossing back above the FP8 thermal threshold. |
-| 44d | MXFP4-E2M1 code usage histogram + LUT12 feasibility — weight analysis + all-matrix quality run | All 2.5B weight slots encoded as MXFP4; code counts per unsigned magnitude; LUT12 = drop 4 least-used codes (0.0, 3.0, 4.0, 6.0), remap to nearest retained | Usage: top-4 codes (0.5→22.3%, 1.0→19.0%, 0.0→11.9%, 1.5→14.9%) cover 68%; bottom-4 cover 28.8%; drop4 maps 3.0/4.0/6.0→2.0 and 0.0→0.5. LUT12 all-matrix: **strict=94.8%, thermal@0.7=92.6%** (baseline: 17.2%/8.6%) | **LUT12 is catastrophically bad (+77.6 pp strict).** The 4 least-used codes by count are structurally critical: zero suppresses 11.9% of weights (replacing with ±0.5 adds correlated noise); {3.0,4.0,6.0} cover the top 16.9% of the dynamic range (all collapse to 2.0). MXFP4 has 8 load-bearing codes — usage skew reflects the weight distribution, not code redundancy. A feasible 12-code variant would require a redesigned non-uniform codebook, not code pruning. |
-| 45 | Per-channel optimal LUT12 (Lloyd-Max, 12 non-neg magnitudes + sign bit) vs MXFP4/5 — all-matrix, E8M0 B=32; Metal encoding | 1 sign + 4 magnitude-index bits = **5.25 bpw**; Lloyd-Max 30 iters per output channel; level-0 pinned to 0.0; 24 B/channel LUT sidecar (18 MB total) | **strict=9.2%, thermal@0.7=3.4%, thermal@1.0=2.8%** vs MXFP4 (17.2%/8.6%) and MXFP5-E2M2 (9.6%/3.6%) at same 5.25 bpw | LUT12 is a **learned MXFP5**: same 5.25 bpw, ~same quality (−0.4 pp strict vs fixed MXFP5). Achievement: 12 optimally-placed magnitudes matches 16 fixed MXFP5 magnitudes. The ~0.4 pp gain is pure optimal placement; most of the MXFP4→LUT12 improvement comes from the extra magnitude bit (+1 bit → 8→12 codes). With exp44b scale LUT: **~5.046 bpw + 18 MB sidecar**. |
-| 45b | Per-channel LUT6 (6 non-neg magnitudes + sign, 4.25 bpw) — all-matrix, E8M0 B=32 | 1 sign + 3 magnitude-index bits = **4.25 bpw** (same as MXFP4); Lloyd-Max 30 iters; 6 of 8 available 3-bit slots used; 24 B/channel LUT sidecar | **strict=20.6%, thermal@0.7=12.0%, thermal@1.0=10.6%** — **worse than MXFP4** (17.2%/8.6%) by +3.4 pp strict / +3.4 pp thermal | Optimal placement of 6 magnitudes cannot compensate for 2 fewer codes than MXFP4's 8. The geometric OCP grid is already near-optimal for this weight distribution. Confirms LUT12's achievement: the benefit of per-channel optimisation only kicks in when using more codes than the fixed grid (12 > 8 at 4 magnitude bits). |
+| 44d | MXFP4-E2M1 code usage histogram + LUT12 feasibility — weight analysis + all-matrix quality run | All 2.5B weight slots encoded as MXFP4; code counts per unsigned magnitude; LUT12 = drop 4 of 16 signed codes (0.0, ±3.0, ±4.0, ±6.0), remap to nearest retained | Usage: top-4 mags (0.5→22.3%, 1.0→19.0%, 0.0→11.9%, 1.5→14.9%) cover 68%; bottom-4 cover 28.8%; drop maps ±{3,4,6}→±2.0 and 0→±0.5. LUT12 all-matrix: **strict=94.8%, thermal@0.7=92.6%** (baseline MXFP4=16 signed codes: 17.2%/8.6%) | **LUT12 is catastrophically bad (+77.6 pp strict).** The dropped codes are structurally critical: zero suppresses 11.9% of weights; ±{3,4,6} cover the top 16.9% of dynamic range (all collapse to ±2.0). MXFP4's 16 signed codes are all load-bearing. A feasible LUT12 requires a redesigned non-uniform codebook, not pruning the OCP grid. |
+| 45 | Per-channel optimal LUT24 (Lloyd-Max, 12 non-neg magnitudes = 23 signed values) vs MXFP4/5 — all-matrix, E8M0 B=32; Metal encoding | **LUT naming: LUT-N = N total signed values**; 12 non-neg mags + sign = 23 signed → LUT24 (rounds to 24); 1 sign + 4 mag-index bits = **5.25 bpw**; Lloyd-Max 30 iters; 24 B/channel LUT sidecar (18 MB) | **strict=9.2%, thermal@0.7=3.4%, thermal@1.0=2.8%** vs MXFP4/16-codes (17.2%/8.6%) and MXFP5/32-codes (9.6%/3.6%) at same 5.25 bpw | LUT24 is a **learned MXFP5**: same 5.25 bpw, ~same quality (−0.4 pp strict vs MXFP5 with 32 signed codes). **Achievement: 23 optimally-placed signed values matches MXFP5's 32 fixed signed values** at the same bit width. With exp44b scale LUT: **~5.046 bpw + 18 MB sidecar**. |
+| 45b | Per-channel LUT12 (6 non-neg magnitudes = 11 signed values, 4.25 bpw) — all-matrix, E8M0 B=32 | 1 sign + 3 mag-index bits = **4.25 bpw** (same as MXFP4/16-signed); Lloyd-Max 30 iters; 6 of 8 available 3-bit slots used | **strict=20.6%, thermal@0.7=12.0%, thermal@1.0=10.6%** — **worse than MXFP4** (17.2%/8.6%) by +3.4 pp | 11 optimally-placed signed values loses to MXFP4's 16 fixed signed values. The OCP geometric grid already near-optimally fills the 3-bit budget. Code count beats optimal placement at same bit width: need more codes than the fixed grid (LUT24 > MXFP5's 32 at 4 mag bits? No — LUT24 has fewer codes but wins via placement). |
+| 46 | LUT24 per-channel, layers 5–36 encoded, layers 0–4 and 37–39 full BF16 — 32/40 layers encoded | Same LUT24 (12 non-neg mags) as exp45; 8 boundary layers at full precision; eff. bpw = (32×5.25 + 8×16)/40 = **7.40 bpw** | **strict=8.4%, thermal@0.7=2.8%, thermal@1.0=1.2%** vs LUT24 all-layers (9.2%/3.4%/2.8%) | −0.8 pp strict / −0.6 pp thermal@0.7 / −1.6 pp thermal@1.0 vs encoding all layers. Boundary layers slightly more sensitive but not dramatically so. Storage cost is severe (7.40 bpw > MXFP6 all-layers at 6.25 bpw) — not a favourable trade within a fixed bpw budget. |
+| 46b | LUT12 per-channel (6 non-neg mags = 11 signed), layers 5–36 encoded, layers 0–4 and 37–39 full BF16 | Same LUT12 (6 non-neg mags) as exp45b; 8 boundary layers full precision; eff. bpw = (32×4.25 + 8×16)/40 = **6.60 bpw** | **strict=17.2%, thermal@0.7=9.2%, thermal@1.0=8.4%** — strict matches MXFP4 all-layers exactly; thermal 0.6 pp worse | Fp boundary layers fully recover LUT12's strict deficit vs MXFP4 (−3.4 pp). Gain is larger than LUT24 case (−0.8 pp), confirming LUT12 is more boundary-sensitive. But 6.60 bpw > MXFP6 (6.25 bpw) for MXFP4-level quality — MXFP4 itself achieves the same at 4.25 bpw. LUT24 dominates at every comparable bpw. |
 
 
 ## Core idea
@@ -4926,31 +4928,32 @@ variant would require redesigning the codebook (e.g. non-uniform spacing with mo
 resolution near zero), not simply dropping the least-used entries from the existing
 OCP grid.
 
-## Experiment 45 — Per-channel LUT12 (optimal 12-entry codebook)
+## Experiment 45 — Per-channel LUT24 (optimal, 23 signed values = 12 non-neg magnitudes)
 
-**Goal:** Instead of the fixed 8-entry OCP MXFP4 grid, fit a **per-output-channel
-optimal 12-entry non-negative magnitude codebook** using Lloyd-Max iteration (k-means
-on E8M0-scaled absolute weights). Sign is factored out and stored as a separate bit,
-exactly as in all OCP MX formats. Measure quality vs MXFP4 (8 magnitudes) and
-MXFP6 (32 magnitudes).
+**Naming convention:** LUT-N refers to N total signed representable values.
+LUT24 has 12 non-negative magnitudes → 23 signed values (±v₁…±v₁₁ + 0) ≈ 24.
+
+**Goal:** Instead of the fixed 8-entry OCP MXFP4 grid (16 signed values), fit a
+**per-output-channel optimal 12-entry non-negative magnitude codebook** (= LUT24)
+using Lloyd-Max. Sign is factored out separately, exactly as in all OCP MX formats.
+Measure quality vs MXFP4 (8 magnitudes, 16 signed) and MXFP6 (32 magnitudes).
 
 ### Encoding convention
 
 Weights are split as `W = sign(W) × |W|`. The LUT holds **12 non-negative
-magnitudes**; sign is the 13th independent bit. The full per-weight code is therefore:
+magnitudes**; sign is a separate bit. The full per-weight code is:
 
 ```
 code = sign_bit (1 bit) + magnitude_index (⌈log₂(12)⌉ = 4 bits) = 5 bits/weight
 ```
 
-12 magnitudes require 4 bits (2⁴ = 16 ≥ 12). Sign requires 1 more bit. Total: **5
-bits/weight = 5.25 bpw** — the same as MXFP5-E2M2. This is equivalent to 23 signed
-values ({−v₁₁, …, −v₁, 0, +v₁, …, +v₁₁}; zero appears once) packed as sign +
-magnitude index.
+12 magnitudes fit in 4 bits (2⁴ = 16 ≥ 12). Total: **5 bits/weight = 5.25 bpw** —
+the same as MXFP5-E2M2 (which has 16 magnitudes, 32 signed values). LUT24's
+23 signed values achieves MXFP5-equivalent quality with 9 fewer signed codes.
 
-This is identical to how MXFP4 works: 3 magnitude bits + 1 sign bit = 4 bits/weight
-(8 magnitudes). LUT12 is 4 magnitude bits + 1 sign bit = 5 bits/weight (12
-magnitudes) — one more magnitude bit than MXFP4.
+This is one more magnitude bit than MXFP4: MXFP4 = 3 mag bits + 1 sign = 4 bpw
+(8 magnitudes, 16 signed). LUT24 = 4 mag bits + 1 sign = 5 bpw (12 magnitudes,
+23 signed).
 
 ### Setup
 
@@ -4971,25 +4974,25 @@ magnitudes) — one more magnitude bit than MXFP4.
 |---|---|---|---|---|
 | MXFP4-E2M1 (8 magnitudes, fixed) | 17.2% | 8.6% | 7.6% | 4.25 |
 | MXFP5-E2M2 (16 magnitudes, fixed) | 9.6% | 3.6% | — | 5.25 |
-| **LUT12 per-channel (12 magnitudes, optimal)** | **9.2%** | **3.4%** | **2.8%** | **5.25+ε** |
+| **LUT24 per-channel (12 magnitudes = 23 signed, optimal)** | **9.2%** | **3.4%** | **2.8%** | **5.25+ε** |
 | MXFP6-E2M3 (32 magnitudes, fixed) | 4.2% | 0.8% | 0.6% | 6.25 |
 
 ### Analysis
 
-**LUT12 halves strict perturbation relative to MXFP4: 17.2% → 9.2% (−8.0 pp).**
+**LUT24 halves strict perturbation relative to MXFP4: 17.2% → 9.2% (−8.0 pp).**
 Thermal@0.7 drops from 8.6% → 3.4% (−5.2 pp), crossing the FP8-equivalent threshold.
 
-**Compared to MXFP5-E2M2 (16 magnitudes, same 5.25 bpw):** LUT12 achieves nearly
-identical quality (9.2% vs 9.6% strict, 3.4% vs 3.6% thermal@0.7). The ~0.4 pp
-strict advantage is the pure gain from per-channel optimal level placement over the
-fixed E2M2 grid — a small but real benefit.
+**Compared to MXFP5-E2M2 (16 magnitudes = 32 signed, same 5.25 bpw):** LUT24
+achieves nearly identical quality (9.2% vs 9.6% strict, 3.4% vs 3.6% thermal@0.7)
+with only 23 signed values vs MXFP5's 32. The ~0.4 pp strict advantage is the pure
+gain from per-channel optimal placement — a small but real benefit.
 
-**Two gains from moving MXFP4→LUT12, disentangled:**
+**Two gains from moving MXFP4→LUT24, disentangled:**
 
 1. **More magnitudes (8→12, +1 bit):** Finer quantisation grid — this accounts for
    most of the improvement. The exp43 E2Mx progression shows that adding one
-   magnitude bit (8→16 codes) halves strict perturbation; LUT12's 8→12 is half
-   that step.
+   magnitude bit (8→16 codes) halves strict perturbation; LUT24's 8→12 captures
+   most of that step.
 
 2. **Optimal placement:** Lloyd-Max concentrates levels where the channel's actual
    weight mass is — near zero and the dominant [0.5, 2.0] range — rather than the
@@ -5001,7 +5004,7 @@ fixed E2M2 grid — a small but real benefit.
 | Component | Cost |
 |---|---|
 | Sign bit (1 bit/weight) | 1.000 bpw |
-| Magnitude index (4 bits/weight, 12 of 16 codes used) | 4.000 bpw |
+| Magnitude index (4 bits/weight, 12 of 16 slots used) | 4.000 bpw |
 | E8M0 block scale (8 bits/block ÷ 32) | 0.250 bpw |
 | Per-channel LUT sidecar (24 B/channel) | ~0.001 bpw |
 | **Total** | **~5.251 bpw** |
@@ -5011,81 +5014,181 @@ With the exp44b LUT scale scheme: scale overhead drops to 0.046 bpw → **~5.046
 
 ### Conclusion
 
-Per-channel LUT12 is a **learned MXFP5**: same 5.25 bpw, same quality neighbourhood,
-but with per-channel optimal level placement instead of the fixed E2M2 grid. The
-~0.4 pp strict quality gain from optimal placement is real but modest. The
-significant benefit is that LUT12 can adapt to any distribution — it would be more
-useful for models with non-standard weight distributions (outlier-heavy, post-RLHF,
-etc.) where the fixed OCP grid is a poor fit.
+Per-channel LUT24 is a **learned MXFP5**: same 5.25 bpw, same quality neighbourhood,
+but with 23 signed values (optimal placement) vs MXFP5's 32 signed values (fixed
+grid). The ~0.4 pp strict quality gain from optimal placement is real but modest.
+The significant benefit is adaptability — LUT24 would help more for models with
+non-standard weight distributions (outlier-heavy, post-RLHF) where the fixed OCP
+grid is a poor fit.
 
 Key numbers in context:
 
-| Format | bpw | strict% | thermal@0.7% | Notes |
-|---|---|---|---|---|
-| MXFP4-E2M1 (OCP fixed) | 4.25 | 17.2% | 8.6% | 1 sign + 3 mag bits |
-| MXFP5-E2M2 (fixed) | 5.25 | 9.6% | 3.6% | 1 sign + 4 mag bits, fixed grid |
-| **LUT12 per-channel** | **5.25+ε** | **9.2%** | **3.4%** | 1 sign + 4 mag bits, optimal grid |
-| MXFP6-E2M3 (OCP fixed) | 6.25 | 4.2% | 0.8% | 1 sign + 5 mag bits |
+| Format | Signed values | bpw | strict% | thermal@0.7% | Notes |
+|---|---|---|---|---|---|
+| MXFP4-E2M1 (OCP fixed) | 16 | 4.25 | 17.2% | 8.6% | 1 sign + 3 mag bits |
+| LUT12 per-channel (exp45b) | 11 | 4.25+ε | 20.6% | 12.0% | 1 sign + 3 mag bits, optimal |
+| MXFP5-E2M2 (fixed) | 32 | 5.25 | 9.6% | 3.6% | 1 sign + 4 mag bits, fixed grid |
+| **LUT24 per-channel (exp45)** | **23** | **5.25+ε** | **9.2%** | **3.4%** | 1 sign + 4 mag bits, optimal |
+| MXFP6-E2M3 (OCP fixed) | 64 | 6.25 | 4.2% | 0.8% | 1 sign + 5 mag bits |
 
-## Experiment 45b — Per-channel LUT6 (6 non-negative magnitudes, 4.25 bpw)
+## Experiment 45b — Per-channel LUT12 (6 non-negative magnitudes = 11 signed values, 4.25 bpw)
 
-**Goal:** Test LUT with only 6 non-negative magnitudes + sign bit. Storage is
-4 bits/weight (4.25 bpw) — identical to MXFP4 — but codes are fewer and optimally
-placed per channel instead of the fixed OCP geometric grid.
+**Goal:** Test LUT with only 6 non-negative magnitudes + sign bit (= LUT12: 11
+signed values). Storage is 4 bits/weight (4.25 bpw) — identical to MXFP4 (16 signed
+values) — but with fewer, optimally-placed codes.
 
 ### Encoding convention
 
-| Property | LUT6 | MXFP4-E2M1 |
+| Property | LUT12 (this exp) | MXFP4-E2M1 |
 |---|---|---|
 | Non-negative magnitudes | 6 | 8 |
+| Signed values | **11** | **16** |
 | Magnitude index bits | ⌈log₂(6)⌉ = 3 | 3 |
 | Sign bit | 1 | 1 |
 | **Total bits/weight** | **4** | **4** |
 | **bpw (E8M0 B=32)** | **4.25+ε** | **4.25** |
-| Signed values | 11 (±v₁…±v₅ + 0) | 15 (±v₁…±v₇ + 0) |
 
-LUT6 uses 6 of the 8 available magnitude slots (3 bits can hold 8 values; 2 slots
-wasted), with placement optimised per channel via Lloyd-Max. MXFP4 uses all 8 slots
-with a fixed geometric grid.
+LUT12 uses 6 of the 8 available 3-bit magnitude slots (2 wasted), with placement
+optimised per channel via Lloyd-Max. MXFP4 fills all 8 slots with a fixed geometric
+grid.
 
 ### Results
 
-| Scheme | strict% | thermal@0.7% | thermal@1.0% | bpw |
-|---|---|---|---|---|
-| **LUT6 per-channel (6 magnitudes, optimal)** | **20.6%** | **12.0%** | **10.6%** | 4.25+ε |
-| MXFP4-E2M1 (8 magnitudes, fixed OCP) | 17.2% | 8.6% | 7.6% | 4.25 |
-| LUT12 per-channel (12 magnitudes, optimal) | 9.2% | 3.4% | 2.8% | 5.25+ε |
-| MXFP6-E2M3 (32 magnitudes, fixed OCP) | 4.2% | 0.8% | 0.6% | 6.25 |
+| Scheme | Signed values | strict% | thermal@0.7% | thermal@1.0% | bpw |
+|---|---|---|---|---|---|
+| **LUT12 per-channel (6 mags, optimal)** | **11** | **20.6%** | **12.0%** | **10.6%** | 4.25+ε |
+| MXFP4-E2M1 (8 mags, fixed OCP) | 16 | 17.2% | 8.6% | 7.6% | 4.25 |
+| LUT24 per-channel (12 mags, optimal) | 23 | 9.2% | 3.4% | 2.8% | 5.25+ε |
+| MXFP6-E2M3 (32 mags, fixed OCP) | 64 | 4.2% | 0.8% | 0.6% | 6.25 |
 
 ### Analysis
 
-**LUT6 is worse than fixed MXFP4: +3.4 pp strict, +3.4 pp thermal@0.7.**
-Optimal placement of 6 magnitudes cannot compensate for having 2 fewer codes than
-the OCP MXFP4 grid. The fixed 8-code geometric spacing outperforms a learned 6-code
-placement at the same bit budget.
+**LUT12 (11 signed) is worse than fixed MXFP4 (16 signed): +3.4 pp strict,
++3.4 pp thermal@0.7.** Optimal placement of 6 magnitudes cannot compensate for
+having 5 fewer signed values than the OCP MXFP4 grid. The fixed 8-magnitude
+geometric spacing outperforms a learned 6-magnitude placement at the same bit budget.
 
-This is the direct contrast with LUT12:
+Contrast with LUT24 (exp45):
 
-| Scheme | Magnitudes | Magnitude bits | vs MXFP4 strict | vs MXFP4 thermal@0.7 |
+| Scheme | Signed values | Mag bits | vs MXFP4 strict | vs MXFP4 thermal@0.7 |
 |---|---|---|---|---|
-| LUT6 (optimal) | 6 | 3 | **+3.4 pp worse** | **+3.4 pp worse** |
-| MXFP4 (fixed) | 8 | 3 | — | — |
-| LUT12 (optimal) | 12 | 4 | −8.0 pp better | −5.2 pp better |
+| LUT12 (optimal, exp45b) | 11 | 3 | **+3.4 pp worse** | **+3.4 pp worse** |
+| MXFP4 (fixed) | 16 | 3 | — | — |
+| LUT24 (optimal, exp45) | 23 | 4 | −8.0 pp better | −5.2 pp better |
 
-**Conclusion:** The number of magnitudes matters more than optimal placement at this
-bit width. With 3 magnitude bits:
+**Conclusion:** Code count beats optimal placement at the 3-bit level. MXFP4's
+geometric grid fills all 8 magnitude slots and happens to be near-optimal for this
+weight distribution (monotone-decreasing usage, more weight mass near zero). LUT12
+wastes 2 slots and cannot recover the loss through placement alone.
 
-- MXFP4 uses all 8 available codes with geometric spacing → wins
-- LUT6 uses only 6 codes with optimal spacing → loses by 3.4 pp
+The LUT24 result (exp45) is the achievement: 23 optimally-placed signed values
+matches MXFP5's 32 fixed signed values, at the same 5.25 bpw, with only an 18 MB
+sidecar. LUT12 confirms the floor: at 3 magnitude bits, filling all 8 slots (MXFP4)
+beats using only 6 optimally-placed ones.
 
-The geometric MXFP4 grid is well-matched to the observed weight distribution
-(monotone-decreasing usage from the exp44d histogram) precisely because geometric
-spacing puts more codes near zero — which is where the weight mass is. Per-channel
-Lloyd-Max on 6 codes cannot do better because there simply aren't enough codes to
-cover the full dynamic range while also providing resolution near zero.
+## Experiment 46 — LUT24 with boundary layers at full precision
 
-The LUT12 result (exp45) was the achievement: 12 optimally-placed magnitudes in
-4 magnitude bits matches 16 fixed magnitudes (MXFP5) in 4 magnitude bits, with
-only an 18 MB per-model sidecar cost. LUT6 confirms the floor: below 8 optimally-
-placed magnitudes, even perfect per-channel fitting cannot match the fixed OCP grid
-at the same bit width.
+**Goal:** Does keeping the first 5 and last 3 layers at full BF16 precision
+improve quality, and by how much? Layers 5–36 (32 of 40) are encoded with LUT24
+per-channel (12 non-neg magnitudes); layers 0–4 and 37–39 remain at BF16.
+
+### Setup
+
+- **Encoding:** LUT24 per-channel (exp45 settings: 12 non-neg magnitudes, Lloyd-Max
+  30 iters, E8M0 B=32, all-matrix gate+up+down), applied only to layers 5–36.
+- **Full-precision layers:** 0–4 (first 5) and 37–39 (last 3) — 8 layers total.
+- **Effective bpw:** (32 × 5.25 + 8 × 16) / 40 = **7.40 bpw** averaged over all
+  MLP layers. The full-precision boundary layers are expensive in storage terms.
+
+### Results
+
+| Scheme | Layers encoded | strict% | thermal@0.7% | thermal@1.0% | eff. bpw |
+|---|---|---|---|---|---|
+| MXFP4-E2M1 all layers (exp43) | 40/40 | 17.2% | 8.6% | 7.6% | 4.25 |
+| LUT24 all 40 layers (exp45) | 40/40 | 9.2% | 3.4% | 2.8% | 5.25 |
+| **LUT24 layers 5–36, fp boundary** | **32/40** | **8.4%** | **2.8%** | **1.2%** | **7.40** |
+| MXFP6-E2M3 all layers (exp43) | 40/40 | 4.2% | 0.8% | 0.6% | 6.25 |
+
+### Analysis
+
+**Quality improvement vs LUT24 all-layers: −0.8 pp strict, −0.6 pp thermal@0.7,
+−1.6 pp thermal@1.0.** The boundary layers contribute modestly to strict
+perturbation but more meaningfully at thermal@1.0 (2.8% → 1.2%).
+
+The quality gain is real but modest — most of the perturbation budget is in the
+middle 32 layers, not the 8 boundary layers. This is consistent with exp16
+(uniform single-layer perturbation across all layers, no dominant culprit).
+
+**The storage cost is severe.** The 8 full-precision layers cost 16 bpw each,
+pushing the average to 7.40 bpw — higher than MXFP6 all-layers (6.25 bpw) despite
+being strictly worse in quality (8.4% vs 4.2% strict). This is an unfavourable
+trade.
+
+**The correct comparison is not bpw but quality-at-fixed-budget.** If the question
+is "given a 5.25 bpw budget, should I encode all 40 layers with LUT24 or encode
+32 layers with LUT24 and spend the savings on the boundary layers?" — the answer is
+that spending 32/40 of the budget on LUT24 and 8/40 on full precision costs 7.4 bpw
+total, far above the 5.25 bpw budget. There is no free lunch: the boundary layers
+must be quantised too if the total bpw target is 5.25.
+
+**Conclusion:** Boundary layers are slightly more sensitive (−0.8 pp strict from
+skipping 8 layers), but not dramatically so. For a deployment where storage is
+constrained to ≤6 bpw, encoding all 40 layers with LUT24 (9.2%/3.4%) is the right
+choice. If storage is unconstrained and quality is the only goal, keeping boundary
+layers full precision gets thermal@1.0 to 1.2% — approaching MXFP6 territory (0.6%)
+at 7.4 bpw.
+
+## Experiment 46b — LUT12 (6 non-neg magnitudes, 4.25 bpw) with boundary layers at full precision
+
+**Goal:** Same boundary-layer question as exp46 but using LUT12 (6 non-neg mags =
+11 signed values, 4.25 bpw per encoded layer) instead of LUT24.
+
+### Setup
+
+- **Encoding:** LUT12 per-channel (exp45b settings: 6 non-neg magnitudes = 11 signed
+  values, Lloyd-Max 30 iters, E8M0 B=32, all-matrix), layers 5–36 only.
+- **Full-precision layers:** 0–4 and 37–39 — 8 layers total.
+- **Effective bpw:** (32 × 4.25 + 8 × 16) / 40 = **6.60 bpw**
+
+### Results
+
+| Scheme | Layers encoded | strict% | thermal@0.7% | thermal@1.0% | eff. bpw |
+|---|---|---|---|---|---|
+| LUT12 all 40 layers (exp45b) | 40/40 | 20.6% | 12.0% | 10.6% | 4.25 |
+| MXFP4-E2M1 all layers (exp43) | 40/40 | 17.2% | 8.6% | 7.6% | 4.25 |
+| **LUT12 layers 5–36, fp boundary** | **32/40** | **17.2%** | **9.2%** | **8.4%** | **6.60** |
+| LUT24 all 40 layers (exp45) | 40/40 | 9.2% | 3.4% | 2.8% | 5.25 |
+| MXFP6-E2M3 all layers (exp43) | 40/40 | 4.2% | 0.8% | 0.6% | 6.25 |
+
+### Analysis
+
+**LUT12 + fp boundary reaches the same strict% as MXFP4 all-layers (17.2%).**
+The 8 full-precision boundary layers exactly compensate for the quality deficit of
+using 11 instead of 16 signed values in the middle 32 layers — strict perturbation
+matches MXFP4 exactly, thermal@0.7 is 0.6 pp worse (9.2% vs 8.6%).
+
+Compared to LUT12 all-layers (exp45b: 20.6% / 12.0%): skipping boundary layers
+saves **−3.4 pp strict** and **−2.8 pp thermal@0.7** — a larger relative gain than
+the LUT24 case (exp46: −0.8 pp / −0.6 pp). This makes sense: LUT12 is more
+sensitive at boundary layers than LUT24, since 11 signed values is a worse
+approximation and the boundary layers are slightly more sensitive.
+
+**Storage cost:** 6.60 bpw — higher than MXFP6 all-layers (6.25 bpw) but now
+worse in quality (17.2% vs 4.2%). Still an unfavourable trade vs encoding all
+layers uniformly.
+
+**The full picture — boundary-layer skip across both LUT variants:**
+
+| Scheme | Encoded layers | Signed values | strict% | thermal@0.7% | eff. bpw |
+|---|---|---|---|---|---|
+| MXFP4 all (exp43) | 40/40 | 16 fixed | 17.2% | 8.6% | 4.25 |
+| LUT12 all (exp45b) | 40/40 | 11 optimal | 20.6% | 12.0% | 4.25 |
+| **LUT12 layers 5–36** | **32/40** | **11 optimal** | **17.2%** | **9.2%** | **6.60** |
+| LUT24 all (exp45) | 40/40 | 23 optimal | 9.2% | 3.4% | 5.25 |
+| **LUT24 layers 5–36** | **32/40** | **23 optimal** | **8.4%** | **2.8%** | **7.40** |
+| MXFP6 all (exp43) | 40/40 | 64 fixed | 4.2% | 0.8% | 6.25 |
+
+**Conclusion:** Adding fp boundary layers to LUT12 recovers strict parity with
+MXFP4 (17.2%) at 6.60 bpw — but MXFP4 itself achieves the same quality at 4.25
+bpw. LUT24 remains the better design at every bpw point where LUT12+boundary
+is competitive.
