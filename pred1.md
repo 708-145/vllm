@@ -38,6 +38,11 @@
 | 27 | Low-rank SVD routing (union top-k gate+up), hot full-precision gate+up, cold E5M3 B=8 gate+up, full W_down — e2e top-1 | Top-k union on \|gate_lr\|∪\|up_lr\| | rank=1024: **0.834 @50% hot**, 0.612 @20%; rank=256: 0.764 @50%; rank=64: 0.392–0.678 | Low-rank routing + E5M3 cold for both gate+up beats exp24 at equal hot% for rank≥256 @50%; at 20% hot exp24 (0.818) still wins; cold E5M3 up tolerable when routing quality is high |
 | 28 | E5M3-encoded SVD factor matrices (binary sign+scale), rank=1024 and 2048, same hybrid scheme as exp27 — e2e top-1 | Top-k union on encoded \|gate_lr\|∪\|up_lr\| | rank=2048: 0.808 @50%, 0.582 @20%; rank=1024: 0.766 @50% | Encoding SVD factors costs ~3–7 pp vs full-prec factors (exp27); rank=2048 partly recovers loss but still −2.6 pp vs exp27 r1024 @50%; routing cost at r=2048 = 105% of full GEMM (no net saving); E5M3 encoding of orthonormal vectors loses too much directional info |
 | 29 | SwiGLU-LR routing: top-k on \|SiLU(gate_lr)·up_lr\| combined signal, hot full-prec, cold E5M3 B=8 gate+up — e2e top-1 | Top-k on \|SiLU(gate_lr)·up_lr\| | rank=1024: 0.732 @50%, 0.568 @20%; rank=256: 0.682 @50% | Worse than exp27 union-LR at all ranks and fractions; combined signal shrinks hot% to exactly frac (no union expansion) — recall drops; union-LR's over-selection (hot%≤2×frac) is beneficial because it catches channels where only one projection is large |
+| 30 | Nonlinear output predictor σ(Px): scalar nonlinearities (none/ReLU/SiLU/Abs) × regression/binary targets × rank 256/2560, trained on recorded activations — routing quality only | Trained P, σ(Px) signal | Full-rank linear reg: F1=0.486 @20%, 0.629 @50% (best); all nonlinearities worse or equal | Nonlinearities do not help; bilinear barrier: SwiGLU = SiLU(gate)×up cannot be expressed as σ(single linear map); full-rank ridge regression beats exp25e cross-cov (0.486 vs 0.32) but still 38% below E5M3 (0.784); weight-derived routing remains superior with zero training cost |
+| 31 | Two-layer MLP predictor h=SiLU(xW1), out=hW2, hidden widths 256/1024/2560, reg and bin targets, SVD warm-start for W1 — routing quality only | Trained MLP signal | hidden=1024 reg: F1=0.393 @20%, 0.572 @50%; hidden=2560 reg: F1=0.385 @20%, 0.571 @50% | Two-layer MLP is worse than single-layer linear regression (exp30 F1=0.486) at 20% hot and comparable at 50%; bilinear barrier not broken despite hidden layer; likely causes: 500 steps insufficient, binary target collapses (F1≈0.14–0.16), high variance across layers (layer8: 0.31 vs layer0: 0.54) suggests underfitting |
+| 31b | Exp31 with ReLU vs SiLU hidden activation comparison, hidden=1024, 500 steps — routing quality only | Trained MLP (ReLU or SiLU hidden) | SiLU: F1=0.393 @20%, 0.572 @50%; ReLU: F1=0.278 @20%, 0.527 @50% | ReLU is worse than SiLU: half the hidden units are dead at init (SVD warm-start has both +/− projections) and never recover; SiLU's smooth negative tail keeps all units active; neither beats linear regression; hidden activation choice is second-order vs the fundamental bilinear barrier |
+| 32 | Sparse W_gate predictor: magnitude pruning (unstructured + row-wise) ± 300-step Adam fine-tune, keep_rates 0.1–0.5 — routing quality only | Top-k on \|x @ W_sparse.T\|, 5 layers [0,8,16,24,32] | Unstructured keep=0.5: F1=0.880 @20%, 0.913 @50%; +ft: 0.902/0.932. Row pruning: F1=0.623 @50% keep, flat across hot%; fine-tune has no effect on row scheme | Unstructured magnitude pruning beats E5M3 (0.784) even at keep=0.3 (0.783); fine-tuning adds +2–7 pp; row pruning is much weaker and unimprovable by fine-tuning (zeroed rows have zero gradient); 50% unstructured sparsity gives E5M3-level routing at 50% GEMM cost |
+| 33 | Sparse W_gate e2e top-1: unstructured keep=0.5 ± 300-step Adam ft, top-k routing, cold gate from sparse, up always full — e2e top-1 | Top-k on \|x @ W_sparse.T\|, cold gate = x @ W_sparse.T | kr=0.5+ft: **0.850 @20%, 0.862 @30%, 0.876 @50%**; kr=0.5 no-ft: 0.830/0.830/0.852 | New best across all hot fractions: +24 pp vs exp27 @20%, +16 pp @30%, +4 pp @50%; fine-tuning adds +2 pp; sparse W_gate doubles as routing signal and cold approximation, eliminating E5M3 encoding step entirely |
 
 
 ## Core idea
@@ -2871,3 +2876,508 @@ limited, and in this asymmetric cost structure **recall dominates**.
 The union routing in exp27 is superior to the SwiGLU-combined signal precisely
 because over-selection is cheap in this scheme.  Routing on the combined
 product discards the union expansion that makes exp27 work.
+
+## Experiment 30 — Nonlinear output predictor: σ(Px) for activity routing
+
+### Motivation
+
+Exp25e showed that a linear cross-covariance predictor is dramatically worse
+than weight-derived routing (F1≈0.32 vs 0.784).  The cross-covariance predictor
+is trained to predict `down_input = SiLU(W_gate x) * W_up x` from `x` — a
+nonlinear target.  Could adding a scalar output nonlinearity (ReLU, SiLU, Abs)
+to the predictor `P ∈ ℝ^{I×H}` capture the nonlinear structure and close
+the gap to E5M3?
+
+The predictor has the same shape as W_gate: `(I, H) = (8192, 2560)` — same
+inference FLOP cost as one gate GEMM at full rank, or cheaper at low rank.
+
+### Scheme
+
+Two predictor ranks × four output nonlinearities × two training targets:
+
+| Rank | Inference cost |
+|---|---|
+| 256 | 10% of one gate GEMM |
+| 2560 (full) | 100% of one gate GEMM |
+
+**Nonlinearities**: none (linear), ReLU, SiLU, Abs
+
+**Targets**:
+- **reg**: MSE on `down_input` (SwiGLU activity values)
+- **bin**: BCE on `hot = |down_input[i]| > mean|down_input|` (binary labels)
+
+**Training**:
+- Linear (none): closed-form ridge regression `P* = (X^T X + λI)^{-1} X^T Y`
+- Nonlinear: Adam, 300 steps, batch=512, lr=3e-3, warm-started from linear solution
+- 80/20 train/test split per layer
+- Evaluated on 5 layers (0, 8, 16, 24, 32), run on MPS (~28s/layer)
+
+### Results (granite-4.2-3b, 5 layers, MPS)
+
+**hot=20%  (k=1638):**
+
+| Nonlinearity | Target | rank=256 F1 | rank=2560 F1 |
+|---|---|---|---|
+| none (linear) | reg | 0.401 | **0.486** |
+| none (linear) | bin | 0.143 | 0.449 |
+| relu | reg | 0.205 | 0.246 |
+| relu | bin | 0.463 | 0.471 |
+| silu | reg | 0.380 | 0.360 |
+| silu | bin | 0.409 | 0.471 |
+| abs  | reg | 0.333 | 0.337 |
+| abs  | bin | 0.144 | 0.167 |
+
+**hot=50%  (k=4096):**
+
+| Nonlinearity | Target | rank=256 F1 | rank=2560 F1 |
+|---|---|---|---|
+| none (linear) | reg | 0.574 | **0.629** |
+| none (linear) | bin | 0.430 | 0.615 |
+| relu | reg | 0.502 | 0.510 |
+| relu | bin | 0.570 | 0.590 |
+| silu | reg | 0.571 | 0.560 |
+| silu | bin | 0.546 | 0.601 |
+| abs  | reg | 0.537 | 0.542 |
+| abs  | bin | 0.431 | 0.443 |
+
+Reference points:
+
+| Method | hot=20% F1 | hot=50% F1 |
+|---|---|---|
+| Linear cross-cov SVD (exp25e) | 0.32 | 0.54 |
+| **Best trained (linear reg, r=2560)** | **0.486** | **0.629** |
+| SVD W_gate rank=1024 (exp25d) | 0.745 | 0.873 |
+| E5M3 W_gate threshold (exp25c) | 0.784 | ~0.873 |
+
+### Key findings
+
+1. **Nonlinearities do not help — linear regression is best.**  Every output
+   nonlinearity (ReLU, SiLU, Abs) produces equal or worse F1 than plain linear
+   regression across both ranks and both hot fractions.
+
+2. **Full-rank linear regression (F1=0.486 @20%)** beats the cross-covariance
+   predictor from exp25e (F1=0.32) because ridge regression finds the exact
+   least-squares solution `P* = arg min ||PX - Y||²`, whereas exp25e's
+   cross-covariance SVD only captured dominant correlation directions.  Both
+   remain far below E5M3 (F1=0.784).
+
+3. **The bilinear barrier.**  The activity target is
+   `a[i] = SiLU(W_gate[i]·x) * W_up[i]·x` — a product of two independent
+   linear maps in `x`.  A scalar output nonlinearity `σ(P[i]·x)` applies to
+   the output of a *single* linear projection per channel.  No scalar `σ`
+   applied to one linear map can express a product of two independent linear
+   maps — the bilinear structure is irreducible.
+
+4. **Why weight-derived predictors win.**  `x @ W_gate.T` directly computes
+   the gate pre-activation — the actual routing signal — without any training.
+   Any learned predictor trying to approximate the post-SwiGLU product is
+   solving a harder problem with no more parameters.
+
+5. **ReLU/bin is the best nonlinear variant** (F1=0.471 @20%, 0.590 @50%),
+   slightly above SiLU/bin, because the binary BCE objective with a ReLU output
+   resembles a logistic classifier — it can learn a decision boundary rather
+   than regressing a continuous target.  But still far below linear regression.
+
+### Conclusion
+
+Adding a scalar output nonlinearity to a trained linear predictor provides no
+benefit for hot-channel routing.  The bilinear structure of SwiGLU activity
+`SiLU(gate) * up` cannot be captured by any `σ(P x)` model.  The best trained
+predictor (full-rank linear regression, F1=0.486 @20%) is 38% below E5M3
+(F1=0.784), which needs no training at all.
+
+A two-layer MLP predictor (with a hidden layer that can represent the product
+`gate * up` jointly) would be required to close this gap, but at that point the
+inference cost exceeds a full GEMM and the motivation for a cheap predictor
+is lost.
+
+## Experiment 31 — Two-layer MLP predictor
+
+### Motivation
+
+Exp30 established that a scalar output nonlinearity σ(Px) cannot break the
+bilinear barrier — predicting `SiLU(W_gate x) * W_up x` requires knowing two
+independent linear projections simultaneously.  A two-layer MLP
+
+```
+h[j] = SiLU(W1[j] · x)       hidden (j = 1..r)
+out[i] = Σ_j W2[i,j] * h[j]  output
+```
+
+can in principle represent the bilinear product: if hidden unit j encodes a
+mixture of `W_gate[i]·x` and `W_up[i]·x`, then W2 can learn to multiply them.
+With sufficient hidden width r this should close the gap to E5M3.
+
+### Scheme
+
+- Architecture: `x → Linear(H,r,bias=False) → SiLU → Linear(r,I,bias=False)`
+- W1 warm-started with top-r rows of Vt_gate (SVD right singular vectors of
+  W_gate) to encode relevant gate directions from step 0
+- W2 initialised N(0, 1/√r)
+- Training: Adam 500 steps, batch=512, lr=3e-3, MPS
+- Two targets: regression (MSE on `down_input`) and binary (BCE on hot labels)
+- 80/20 train/test split; evaluated on 5 layers (0, 8, 16, 24, 32)
+
+### Inference cost
+
+| Hidden width | FLOPs | % of one gate GEMM |
+|---|---|---|
+| 256 | 5.5M | 13% |
+| 1024 | 22.0M | 52% |
+| 2560 | 55.1M | 131% |
+
+### Results (granite-4.2-3b, 5 layers, MPS, ~24s/layer)
+
+**hot=20%  (k=1638) — F1 per layer and mean:**
+
+| Hidden | Target | L0 | L8 | L16 | L24 | L32 | Mean |
+|---|---|---|---|---|---|---|---|
+| 256 | reg | 0.355 | 0.261 | 0.378 | 0.334 | 0.423 | 0.350 |
+| 256 | bin | 0.135 | 0.166 | 0.152 | 0.156 | 0.097 | 0.141 |
+| 1024 | reg | 0.475 | 0.306 | 0.395 | 0.343 | 0.444 | **0.393** |
+| 1024 | bin | 0.153 | 0.173 | 0.158 | 0.167 | 0.104 | 0.151 |
+| 2560 | reg | 0.543 | 0.306 | 0.273 | 0.311 | 0.492 | 0.385 |
+| 2560 | bin | 0.163 | 0.177 | 0.163 | 0.167 | 0.108 | 0.156 |
+
+**hot=50%  (k=4096) — F1 per layer and mean:**
+
+| Hidden | Target | L0 | L8 | L16 | L24 | L32 | Mean |
+|---|---|---|---|---|---|---|---|
+| 256 | reg | 0.553 | 0.522 | 0.557 | 0.550 | 0.581 | 0.553 |
+| 256 | bin | 0.416 | 0.466 | 0.443 | 0.439 | 0.401 | 0.433 |
+| 1024 | reg | 0.618 | 0.541 | 0.564 | 0.553 | 0.587 | **0.572** |
+| 1024 | bin | 0.413 | 0.475 | 0.457 | 0.453 | 0.395 | 0.438 |
+| 2560 | reg | 0.659 | 0.541 | 0.515 | 0.534 | 0.607 | 0.571 |
+| 2560 | bin | 0.412 | 0.478 | 0.460 | 0.451 | 0.400 | 0.440 |
+
+Reference comparison:
+
+| Method | hot=20% F1 | hot=50% F1 | Cost |
+|---|---|---|---|
+| Exp31 MLP hidden=1024 reg | 0.393 | 0.572 | 52% of GEMM |
+| Exp30 linear reg full-rank | **0.486** | **0.629** | 100% of GEMM |
+| SVD W_gate rank=1024 (exp25d) | 0.745 | 0.873 | 52% of GEMM |
+| E5M3 W_gate (exp25c) | 0.784 | ~0.873 | ~100% of GEMM |
+
+### Key findings
+
+1. **Two-layer MLP is worse than single-layer linear regression at 20% hot**
+   (best MLP F1=0.393 vs linear 0.486) and only comparable at 50% hot
+   (0.572 vs 0.629).  The bilinear barrier is not broken.
+
+2. **Binary target collapses** — F1≈0.14–0.16 at 20% hot regardless of hidden
+   width.  BCE with sigmoid on a 8192-way binary output is harder to optimise
+   than MSE; the model converges to predicting near-uniform probabilities.
+
+3. **High layer variance** — layer 0 (F1=0.54 @20%, hidden=2560) vs layer 8
+   (F1=0.31) suggests the MLP is overfitting to layer 0's structure but
+   underfitting layers with more complex activity patterns.  500 steps is
+   insufficient for stable convergence across all layers.
+
+4. **Why the hidden layer doesn't help**: W1 is warm-started from SVD of W_gate,
+   so the hidden units encode gate directions — but W_up directions are absent
+   from W1 initialisation and must be learned from scratch in 500 gradient steps
+   against a noisy MSE signal.  The MLP cannot efficiently discover the
+   `(gate_direction, up_direction)` pairing needed per channel.
+
+5. **Cost-quality frontier**: exp31 hidden=1024 costs the same FLOPs as SVD
+   routing rank=1024 (52%) but achieves F1=0.393 vs SVD's 0.745 @20% hot.
+   The trained MLP has no advantage over the weight-derived SVD at any
+   comparable cost point.
+
+### Conclusion
+
+A two-layer MLP predictor trained on recorded activations does not improve
+over single-layer linear regression and is far below weight-derived routing.
+The key obstacle: discovering per-channel `(W_gate[i], W_up[i])` direction
+pairs from gradient descent on 12k tokens is harder than it sounds, and
+the model has no inductive bias toward the weight structure the network uses.
+The weight matrices *already encode* the optimal routing signal — no learned
+predictor can improve on using them directly.
+
+## Experiment 31b — Hidden activation comparison: ReLU vs SiLU
+
+### Motivation
+
+Exp31 used SiLU as the hidden activation.  For a target that is a product of
+two linear maps — `SiLU(W_gate x) * W_up x` — ReLU hidden units might be
+preferable in theory: `ReLU(a) * b` has a hard zero region (when a<0), and a
+two-layer MLP with ReLU hidden units can represent bilinear products exactly
+with one hidden-unit pair per output channel.  Does ReLU outperform SiLU?
+
+### Scheme
+
+Same as exp31 but with `hidden_acts = [silu, relu]`, `hidden=1024`, `n_steps=500`.
+W1 warm-started from SVD of W_gate (top-1024 Vt rows) in both cases.
+
+### Results (granite-4.2-3b, 5 layers 0/8/16/24/32, MPS, ~13s/layer)
+
+| Act | hot=20% F1 | hot=50% F1 |
+|---|---|---|
+| SiLU (exp31) | **0.393** | **0.572** |
+| ReLU | 0.278 | 0.527 |
+| Linear reg full-rank (exp30) | **0.486** | **0.629** |
+| SVD W_gate rank=1024 (exp25d) | 0.745 | 0.873 |
+
+Per-layer breakdown (hot=20%, reg target):
+
+| Layer | SiLU | ReLU |
+|---|---|---|
+| 0 | 0.463 | 0.341 |
+| 8 | 0.303 | 0.201 |
+| 16 | 0.394 | 0.198 |
+| 24 | 0.360 | 0.212 |
+| 32 | 0.448 | 0.438 |
+| **mean** | **0.393** | **0.278** |
+
+### Key findings
+
+**ReLU is worse than SiLU across all layers and hot fractions.**
+
+The cause is dying-ReLU at initialisation.  W1 is warm-started from SVD right
+singular vectors of W_gate — a matrix with both positive and negative values.
+The hidden pre-activations `W1 x` therefore have both signs at initialisation,
+meaning roughly half of ReLU units are in the zero-gradient region for any given
+token.  With only 500 gradient steps and a high-dimensional target (I=8192),
+these dead units never recover — the effective hidden width is ~512, not 1024.
+
+SiLU's smooth negative tail (`SiLU(x) ≈ x * 0.17` for moderately negative x)
+keeps gradient flowing through all units regardless of sign, making it strictly
+better for this warm-started initialisation scheme.
+
+### Conclusion
+
+ReLU does not help and is actively harmful relative to SiLU when W1 is
+warm-started from weight SVD.  The theoretical representational advantage of
+ReLU for bilinear products is irrelevant in practice: the dying-unit problem
+dominates at this training budget.  Neither activation closes the gap to
+weight-derived routing — hidden activation choice is a second-order concern
+compared to the fundamental bilinear barrier diagnosed in exp30–31.
+
+
+---
+
+## Experiment 32 — Sparse W_gate predictor
+
+### Motivation
+
+Exp25–31 confirmed that the optimal routing signal is `x @ W_gate.T` — the weight
+matrix itself.  Learned predictors are all worse.  This experiment asks a different
+question: can we **sparsify W_gate** while keeping routing quality competitive?
+
+A sparse W_gate has two benefits:
+1. **Faster routing GEMM** — unstructured sparsity gives a theoretical upper bound of
+   `keep_rate × FLOP`; structured (row) sparsity gives real hardware savings.
+2. **Compact storage** — CSR/CSC formats or block-sparse representations cut memory
+   bandwidth for the routing step.
+
+### Scheme
+
+Two pruning strategies, each with optional 300-step Adam fine-tuning:
+
+| Scheme | Description |
+|---|---|
+| `unstructured` | Zero the `(1−keep_rate)` weights with smallest `\|w\|` element-wise |
+| `row` | Zero entire output rows (channels) with smallest L2 norm |
+| `unstructured_ft` | Magnitude-prune, then 300 Adam steps (MSE vs `x @ W_gate_full.T`) with mask fixed |
+| `row_ft` | Row-prune, then 300 Adam steps with mask fixed |
+
+Keep rates swept: **0.5, 0.3, 0.2, 0.1** (fraction of weights retained).
+Hot fractions evaluated: **20%** and **50%** of intermediate channels.
+Layers evaluated: **0, 8, 16, 24, 32** (5 layers, ~28 s/layer on MPS).
+
+### Results (granite-4.2-3b, 5 layers 0/8/16/24/32, MPS)
+
+#### Routing F1 — hot=20%  (k=1638 out of 8192)
+
+| Scheme | kr=0.5 | kr=0.3 | kr=0.2 | kr=0.1 | kr=1.0 (full) |
+|---|---|---|---|---|---|
+| unstructured | **0.880** | 0.783 | 0.712 | 0.608 | 1.000 |
+| unstructured_ft | **0.902** | **0.828** | **0.773** | **0.685** | 1.000 |
+| row | 0.623 | 0.440 | 0.330 | 0.294 | 1.000 |
+| row_ft | 0.623 | 0.440 | 0.330 | 0.294 | 1.000 |
+| **E5M3 W_gate (exp25c)** | — | — | — | — | **0.784** |
+| **SVD rank=1024 (exp25d)** | — | — | — | — | 0.745 |
+
+#### Routing F1 — hot=50%  (k=4096 out of 8192)
+
+| Scheme | kr=0.5 | kr=0.3 | kr=0.2 | kr=0.1 | kr=1.0 (full) |
+|---|---|---|---|---|---|
+| unstructured | **0.913** | 0.836 | 0.779 | 0.695 | 1.000 |
+| unstructured_ft | **0.932** | **0.879** | **0.840** | **0.776** | 1.000 |
+| row | 0.554 | 0.536 | 0.527 | 0.519 | 1.000 |
+| row_ft | 0.554 | 0.536 | 0.527 | 0.519 | 1.000 |
+| **SVD rank=1024 (exp25d)** | — | — | — | — | **0.873** |
+
+#### Storage / compute savings
+
+| keep_rate | Non-zeros (8192×2560) | Zeroed | Unstructured GEMM saving |
+|---|---|---|---|
+| 0.5 | 10,485,760 | 50% | ≤50% FLOPs |
+| 0.3 | 6,291,456 | 70% | ≤70% FLOPs |
+| 0.2 | 4,194,304 | 80% | ≤80% FLOPs |
+| 0.1 | 2,097,152 | 90% | ≤90% FLOPs |
+
+### Key findings
+
+**Unstructured magnitude pruning is surprisingly strong.**  At keep=0.5 (50%
+sparsity), unstructured pruning achieves F1=0.880 @20% hot — beating E5M3
+encoding (0.784) by 9.6 pp without any fine-tuning.  Even at keep=0.3 (70%
+sparsity) it matches E5M3 (0.783 vs 0.784).  This is a better operating point
+than E5M3: same routing quality at 70% fewer routing FLOP.
+
+**Fine-tuning adds +2–7 pp across the board.**  300 Adam steps (MSE target)
+consistently improve routing F1.  The gain is largest at high sparsity:
+keep=0.1 ft (0.685) vs no-ft (0.608) is +7.7 pp @20% hot.  Even keep=0.5 ft
+(0.902) beats E5M3 by 11.8 pp.
+
+**Row pruning is much weaker.**  Zeroing entire channels (rows of W_gate) loses
+substantial routing information at every keep_rate.  At keep=0.5, row pruning
+reaches only F1=0.623 vs unstructured's 0.880 — a 25.7 pp gap.  The signal
+degrades almost linearly with keep_rate.  Row pruning also shows the flat
+behaviour across hot% seen in exp25d for low-rank SVD: when entire channels are
+zeroed the remaining channels rank poorly relative to the oracle.
+
+**Fine-tuning has no effect on row pruning.**  `row_ft` == `row` at all
+keep_rates because zeroed rows contribute no gradient — the mask constrains W to
+the pruned subspace, so the per-channel gradient `dL/dW[i]` for zeroed row `i`
+is always zero.  The 300 Adam steps only re-fit the non-zeroed rows to better
+match the full matrix's responses within the active subspace, but since the
+zero-row channels remain absent from the routing signal entirely, F1 cannot
+improve.
+
+**Comparison to other routing schemes:**
+
+| Scheme | F1 @20% hot | F1 @50% hot | Routing cost |
+|---|---|---|---|
+| Full W_gate (oracle) | 1.000 | 1.000 | 1× GEMM |
+| Unstructured kr=0.5 +ft | **0.902** | **0.932** | ≤0.50× GEMM |
+| Unstructured kr=0.5 no-ft | 0.880 | 0.913 | ≤0.50× GEMM |
+| E5M3 W_gate (exp25c) | 0.784 | — | 1× GEMM (low bandwidth) |
+| Unstructured kr=0.3 no-ft | **0.783** | 0.836 | ≤0.30× GEMM |
+| SVD rank=1024 (exp25d) | 0.745 | 0.873 | ~0.25× GEMM |
+| Linear reg full-rank (exp30) | 0.486 | 0.629 | 1× GEMM (trained P) |
+
+### Conclusion
+
+**Unstructured magnitude pruning of W_gate is the most efficient routing
+scheme found so far.**  At keep=0.5, it beats E5M3 in routing quality while
+halving the routing GEMM cost.  At keep=0.3, it matches E5M3 quality at 70%
+fewer FLOPs.  Fine-tuning adds another +2–7 pp at small cost (offline, 300
+steps).
+
+Row (structured) pruning is the wrong direction: it removes entire channel
+directions and cannot be recovered by fine-tuning.  Unstructured sparsity
+preserves the directional information of each channel row while zeroing
+low-magnitude weights that contribute little to the dot-product ordering.
+
+The practical implication: for the hybrid hot/cold inference scheme, replace
+E5M3-encoded W_gate with a 50% unstructured-sparse W_gate (stored in CSR or
+2:4 structured sparse format).  This simultaneously reduces routing latency
+and improves routing quality, and is fully compatible with the exp27 union
+routing scheme (apply sparsity to both gate and up factor matrices).
+
+
+---
+
+## Experiment 33 — Sparse W_gate end-to-end top-1 assessment
+
+### Motivation
+
+Exp32 established that unstructured magnitude pruning (keep=0.5) + 300 Adam fine-tune
+steps gives F1=0.902 @20% hot — 11.8 pp above E5M3's 0.784.  This experiment tests
+whether that routing improvement translates to better **end-to-end top-1 match**.
+
+### Scheme
+
+```
+W_sparse[l] = magnitude_prune_unstructured(W_gate[l], keep=0.5)
+           +  300 Adam steps (MSE vs x @ W_gate_full.T, mask fixed)
+
+routing:  hot = top-k(|x @ W_sparse.T|)          # top-k hot channels per token
+hot:      gate = x @ W_gate_full.T (full precision)
+          up   = x @ W_up_full.T   (full precision — always, as in exp24)
+cold:     gate = x @ W_sparse.T    (sparse approx, reusing routing GEMM)
+merge:    gate = where(hot, gate_full, gate_sparse)
+swiglu:   silu(gate) * up_full
+out:      swiglu @ W_down.T (full precision)
+```
+
+Key design choice: **W_sparse doubles as both routing signal and cold approximation**,
+so the routing GEMM is the only extra cost (no separate E5M3 encoding pass).
+
+Compared:
+- `kr=0.5+ft` — 50% kept, 300 Adam ft steps
+- `kr=0.5`    — 50% kept, no ft (pure magnitude pruning)
+
+Hot fractions swept: **20%, 30%, 50%**.
+
+### Results (granite-4.2-3b, all 40 layers, prefill, 8 prompts / 500 tokens)
+
+| Scheme | hot=20% | hot=30% | hot=50% |
+|---|---|---|---|
+| **kr=0.5+ft** | **0.850** | **0.862** | **0.876** |
+| kr=0.5 no-ft | 0.830 | 0.830 | 0.852 |
+| exp24 E5M3 threshold (T=0.20, ~88% hot) | — | — | 0.818 (adaptive) |
+| exp27 SVD union rank=1024 | 0.612 | 0.702 | **0.834** |
+| exp24 threshold T=0.50 | — | 0.798 | 0.736 |
+| exp14 ternary | 0.588 | 0.632 | — |
+
+Δ vs best prior result at each hot fraction:
+
+| hot% | exp33 kr=0.5+ft | Prior best | Δ |
+|---|---|---|---|
+| 20% | **0.850** | 0.818 (exp24 adaptive) | **+3.2 pp** |
+| 30% | **0.862** | 0.798 (exp24 T=0.50) | **+6.4 pp** |
+| 50% | **0.876** | 0.834 (exp27) | **+4.2 pp** |
+
+### Key findings
+
+**New best at every hot fraction.**  kr=0.5+ft achieves 0.850/0.862/0.876 —
+the highest top-1 match rates in the entire experiment series.
+
+**Fine-tuning adds a consistent +2 pp.**  The gap between kr=0.5+ft and kr=0.5
+no-ft is small (0.850 vs 0.830 @20%, 0.876 vs 0.852 @50%) but consistent across
+all hot fractions.  In routing F1 terms (exp32) the gap was +2.2 pp @20% hot, and
+that translates roughly proportionally to e2e match.
+
+**Sparse W_gate vs E5M3 as cold approximation.**  The surprising result is that
+using sparse W_gate directly as the cold approximation (not E5M3-encoded) is better
+than exp24's E5M3 scheme.  Both have similar SNR on cold channels, but the sparse
+approximation's error is concentrated on small-magnitude weights (exactly those
+pruned), whereas E5M3 uniformly distorts all channels.  The routing quality gain
+(F1 0.902 vs 0.784) is the primary driver — fewer false-negative cold channels
+means fewer wrong cold values propagate through SiLU.
+
+**Dense hot fractions are no longer penalised.**  Exp24 was best at T=0.20 (~88%
+hot) because lower T meant more hot channels and less cold-channel error.  Exp33
+monotonically improves with more hot channels (0.850 → 0.862 → 0.876) as expected
+for top-k routing, but the 20% point already beats exp24's best.
+
+**E5M3 encoding is no longer needed.**  The sparse W_gate serves as both routing
+signal and cold approximation in a single matrix multiply, eliminating the E5M3
+block-scale quantisation step entirely.  This simplifies the implementation.
+
+### Comparison to all prior schemes
+
+| Scheme | match @20% hot | match @50% hot | notes |
+|---|---|---|---|
+| **Exp33 kr=0.5+ft** | **0.850** | **0.876** | new best |
+| Exp33 kr=0.5 no-ft | 0.830 | 0.852 | |
+| Exp27 SVD r1024 union | 0.612 | 0.834 | cold E5M3 gate+up |
+| Exp24 E5M3 T=0.20 | 0.818 (88% hot) | — | adaptive threshold |
+| Exp24 E5M3 T=0.50 | — | 0.736 | |
+| Exp14 ternary | 0.588 | — | |
+
+### Conclusion
+
+**Unstructured 50%-sparse W_gate + 300 Adam steps is the strongest routing scheme
+found so far**, setting new records at 20%, 30%, and 50% hot fractions.  The scheme
+is also simpler than exp24/27: no E5M3 encoding, no SVD, just magnitude pruning and
+a single sparse GEMM that does double duty as routing signal and cold approximation.
+
+The 300 Adam fine-tune steps add +2 pp at the cost of a one-time ~140 s offline
+pass (MPS, all 40 layers).  Given the consistent gain, fine-tuning is recommended.
+
+Next step: extend to threshold routing (adaptive hot%) to match exp24's operating
+point of ~88% hot, and measure whether the gain over exp24 persists there.
