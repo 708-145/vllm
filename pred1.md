@@ -46,6 +46,7 @@
 | 34 | Thermal match rate for exp33 kr=0.5+ft and exp24 reference schemes — new metric | Thermal match (T=0.7/1.0, τ=ln2): forgive if gap < T·ln2 | sparse @20%: strict=15.0%, **thermal@0.7=5.6%, thermal@1.0=5.0%**; sparse @50%: strict=12.4%, **thermal@0.7=4.8%, thermal@1.0=3.6%** | Thermal metric reveals ~8–10 pp of strict perturbation is below the noise floor at T=0.7; exp33 @50% hot is effectively FP8-equivalent (3.6% thermal@1.0); exp24 E5M3 T=0.20 drops from 18.2% strict → 7.6% thermal@0.7; exp24 T=0.50 still 16% thermal — its errors are harder (large gap ~1.27 logits) |
 | 35 | Sparse up projection + zero-cold comparison; target regime 20–30% hot; strict + thermal metric | gate routing: top-k(\|x @ W_gate_sparse.T\|); cold gate = W_gate_sparse, cold up = W_up_sparse or zero; up always full for hot | sparse_gate+up @20%: strict=21.2%, **thermal@0.7=9.4%**; sparse_gate+up @30%: strict=18.4%, **thermal@0.7=8.6%**; zero_cold @20%: strict=76.8%, thermal=73.4% | Sparse up cold is worse than full-precision up (exp33): +7.8 pp strict at 20% hot; however thermal gap is narrower (+2.8 pp). Zero cold is catastrophically hard (gap 5.3 logits @20%): omitting cold channels is a hard error, not recoverable thermally. Sparse_gate_only @30% hot is the new sweet spot: strict=12.0%, thermal@0.7=5.6%, thermal@1.0=4.8% — FP8-equivalent at T=1.0 at the target hot fraction |
 | 36 | E5M3 B=8 cold up with sparse gate routing — e2e strict + thermal | cold gate = W_gate_sparse; cold up = E5M3 B=8 sign+scale; hot = full precision; down = full | @20% hot: strict=38.6%, **thermal@0.7=30.6%**; @30%: strict=30.0%, thermal@0.7=23.4%; @50%: strict=19.8%, thermal=10.8% | E5M3 cold up is far worse than full-precision up at sparse hot fractions (20–30%): +25 pp strict / +24 pp thermal at 20% hot; mean gap ~2.0 logits (hard errors). Only recovers at 50% hot (+6.6 pp strict, thermal@1.0=8.2%). W_up must stay full precision for cold channels regardless of up encoding scheme — confirming exp20 and exp35 at the cold-up encoding level |
+| 37 | 3bpw cold up: 2-bit/weight, 2 E5M3 scales per B=16 block, TARE-optimal EM, sparse gate routing — e2e strict + thermal | cold up = ±{s_lo,s_hi} per B=16, E5M3 quantised scales; hot = full; down = full | @20%: strict=24.4%, **thermal@0.7=15.6%**; @30%: strict=22.6%, thermal@0.7=13.2%; @50%: strict=16.8%, thermal@0.7=8.4% | 3bpw halves the penalty vs 1bpw E5M3 (~11 pp strict penalty vs ~22 pp at 20–30% hot), but still +7–9 pp thermal over full-precision up. Gap metric drops from 2.0 → 1.39 logits (softer errors) but not yet matching full-prec (1.06). At 50% hot, 3bpw is within 3 pp strict / 3 pp thermal of full-prec up. W_up cold must still be full precision for the 20–30% hot target regime |
 
 
 ## Core idea
@@ -3872,3 +3873,125 @@ down:      full precision always
 
 At 30% hot this gives strict=12.0%, thermal@T=1.0=**4.8%** (FP8-equivalent).
 No encoding of cold W_up is competitive with full precision at these hot fractions.
+
+---
+
+## Experiment 37 — 3bpw cold up (2-bit/weight, 2 E5M3 scales, B=16)
+
+### Motivation
+
+Exp36 showed E5M3 B=8 1bpw cold up adds +25 pp strict / +24 pp thermal at 20%
+hot — too lossy.  The hypothesis: a single scale per 8 weights cannot represent
+the range of `|w_up|` values within a block.  Two magnitude levels per block
+should substantially reduce approximation error.
+
+### Encoding scheme
+
+**3 bits per weight** = 2 bits of codes + 2 E5M3 scale bytes per B=16 block:
+
+```
+Storage per 16-weight block:
+  codes:  16 weights × 2 bits = 32 bits = 4 bytes
+  scales: 2 × E5M3 (1 byte each) = 2 bytes
+  total:  6 bytes / 16 weights = 3 bits/weight = 2.67× vs BF16
+
+Code alphabet: {−s_hi, −s_lo, +s_lo, +s_hi}
+  bit layout: [sign | magnitude_level]  (MSB = sign, LSB = level)
+```
+
+**TARE-optimal scale selection** via EM in log-space:
+1. Init: split block by median `|w|`, compute tilt-weighted geometric mean of each half → `(s_lo_init, s_hi_init)`
+2. E-step: assign each weight to nearest centroid in log-space (threshold = geometric midpoint `√(s_lo·s_hi)`)
+3. M-step: recompute each centroid as tilt-weighted geometric mean of its members
+4. Repeat ≤10 steps; typically converges in 3–4
+5. Quantise both centroids to E5M3
+
+Build time: **14 s** for all 40 layers (vs 6 s for 1bpw E5M3).
+
+### Results (granite-4.2-3b, 500 prefill tokens)
+
+#### Full results
+
+| Scheme | Strict% | Thermal @T=0.7 | Thermal @T=1.0 | Mean gap |
+|---|---|---|---|---|
+| sparse+3bpw_up @20% | 24.4% | 15.6% | 13.2% | 1.392 logits |
+| sparse+1bpw_up @20% | 38.6% | 30.6% | 27.0% | 2.005 logits |
+| sparse_gate_only @20% | **13.4%** | **6.6%** | **5.6%** | 1.062 logits |
+| sparse+3bpw_up @25% | 23.6% | 13.0% | 11.0% | 1.179 logits |
+| sparse+1bpw_up @25% | 34.4% | 24.6% | 20.6% | 1.610 logits |
+| sparse_gate_only @25% | **12.6%** | **5.6%** | **4.6%** | 1.048 logits |
+| sparse+3bpw_up @30% | 22.6% | 13.2% | 10.4% | 1.161 logits |
+| sparse+1bpw_up @30% | 30.0% | 23.4% | 19.2% | 1.584 logits |
+| sparse_gate_only @30% | **12.0%** | **5.6%** | **4.8%** | 1.081 logits |
+| sparse+3bpw_up @50% | 16.8% | 8.4% | 6.8% | 0.874 logits |
+| sparse+1bpw_up @50% | 19.8% | 10.8% | 8.2% | 1.064 logits |
+| sparse_gate_only @50% | **13.2%** | **5.4%** | **4.4%** | 0.833 logits |
+| exp24 E5M3 T=0.20 | 18.2% | 7.6% | 4.8% | 0.661 logits |
+
+#### Penalty vs full-precision cold up
+
+| hot% | 3bpw Δ strict | 3bpw Δ th@0.7 | 3bpw Δ th@1.0 | 3bpw Δ gap | 1bpw Δ strict | 1bpw Δ th@0.7 |
+|---|---|---|---|---|---|---|
+| 20% | +11.0 pp | +9.0 pp | +7.6 pp | +0.33 L | +25.2 pp | +24.0 pp |
+| 25% | +11.0 pp | +7.4 pp | +6.4 pp | +0.13 L | +21.8 pp | +19.0 pp |
+| 30% | +10.6 pp | +7.6 pp | +5.6 pp | +0.08 L | +18.0 pp | +17.8 pp |
+| 50% | +3.6 pp | +3.0 pp | +2.4 pp | +0.04 L | +6.6 pp | +5.4 pp |
+
+### Key findings
+
+**3bpw halves the cold-up penalty vs 1bpw E5M3.**  At 20% hot, the strict
+penalty drops from +25.2 pp (1bpw) to +11.0 pp (3bpw); the thermal@0.7 penalty
+drops from +24.0 pp to +9.0 pp.  Mean gap falls from 2.005 to 1.392 logits —
+errors are substantially softer.
+
+**The improvement is proportional and consistent.**  At every hot fraction, 3bpw
+reduces the penalty by roughly 2× vs 1bpw in both strict and thermal terms.
+This is consistent with the 2× increase in bits per weight (1→2) and confirms
+the TARE-optimal 2-level quantisation is working correctly.
+
+**3bpw is still not competitive with full-precision up at 20–30% hot.**  The
+remaining penalty is +9–11 pp thermal@0.7, placing 3bpw cold up at 13–16%
+thermal perturbation — solidly in the NVFP4 range, not FP8.  Full-precision up
+at 20–30% hot gives 5.6–6.6% thermal@0.7 (near FP8).
+
+**At 50% hot, 3bpw comes within 3 pp.**  Strict: 16.8% vs 13.2% (Δ=+3.6 pp);
+thermal@0.7: 8.4% vs 5.4% (Δ=+3.0 pp); mean gap: 0.874 vs 0.833 (+0.04 L —
+nearly identical).  At this hot fraction, 3bpw cold up is borderline acceptable.
+
+**The fundamental constraint is unchanged.**  Going from 1bpw to 3bpw halves
+the penalty but does not eliminate it.  The cold-up error is not a quantisation
+precision problem alone — it reflects the structural issue that up errors at
+boundary channels (small but non-zero cold gate) are not suppressed by SiLU.
+Doubling bits halves the signal error but the error mechanism itself is preserved.
+
+### Extrapolation
+
+The trend penalty(bpw) scales roughly as:
+
+| bpw | Δ thermal@0.7 @20% hot | Gap |
+|---|---|---|
+| 1 (E5M3 B=8) | +24.0 pp | 2.005 L |
+| 3 (2-level E5M3 B=16) | +9.0 pp | 1.392 L |
+| ∞ (full precision) | 0 pp | 1.062 L |
+
+The diminishing returns suggest that even 4bpw (4 levels) would reduce the
+thermal penalty to roughly +4–5 pp — still above the FP8-equivalent floor.
+This is consistent with the structural argument: the cold-up error floor is
+set by the boundary-channel effect, not quantisation noise.
+
+### Conclusion
+
+**3bpw halves the cold-up penalty vs 1bpw but does not close the gap to
+full-precision up.**  At 20–30% hot the thermal perturbation is 13–16% with
+3bpw cold up, vs 5–7% with full-precision up.  The gap is roughly +9 pp
+thermal@0.7 — too large for the target FP8-equivalent operating point.
+
+The cold-up encoding strategy is reaching diminishing returns.  The gap to
+full-precision up has a structural floor from boundary-channel SwiGLU errors
+that cannot be eliminated by better quantisation of W_up.
+
+**Confirmed architecture for the 20–30% hot target regime remains:**
+```
+cold gate: x @ W_gate_sparse.T   (sparse approx — free)
+cold up:   x @ W_up_full.T       (full precision — non-negotiable)
+```
