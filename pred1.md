@@ -129,6 +129,61 @@ top1_match = (lf.argmax(-1) == lh.argmax(-1)).float().mean()
 
 Reuses the same `lf`/`lh` from the KL computation — no extra cost.
 
+### Perturbation impact reference
+
+Top-1 perturbation rate (= 1 − top-1 match) is interpretable by analogy with
+quantization schemes whose quality is well-characterised in practice.
+
+#### Perceptibility
+
+| Perturbation | Human perceptibility | Benchmark impact |
+|---|---|---|
+| 0–3% | Imperceptible; outputs functionally identical | MMLU/HellaSwag within noise |
+| 3–8% | Rarely noticeable; occasional phrasing differences | ~0.5–1 pp benchmark drop |
+| 8–15% | Occasionally noticeable on long outputs; factual drift possible | ~1–3 pp benchmark drop |
+| 15–25% | Noticeable on direct A/B comparison; coherence mostly preserved | ~3–7 pp benchmark drop |
+| >30% | Clearly degraded; repetition and hallucination more frequent | Significant benchmark drop |
+
+A 15% perturbation means 1 in 7 greedy-decode positions would pick a different
+token.  In isolation most swaps involve near-synonyms or punctuation; over a
+generation of length N the probability of at least one diverged token is roughly
+`1 − (1 − perturb)^N`.  At N=20 and 15% perturbation that is ~96% — essentially
+every response diverges somewhere, though each divergence may be invisible to a
+casual reader.
+
+#### Comparison with production quantization schemes
+
+Approximate top-1 perturbation rates for typical LLM quantization, relative to
+BF16 baseline (values are model- and calibration-dependent; treat as order-of-
+magnitude):
+
+| Quantization scheme | Typical perturbation | vLLM default |
+|---|---|---|
+| BF16 → FP16 | ~0% | — |
+| BF16 → INT8 W8A8 | ~1–3% | some backends |
+| BF16 → FP8 E4M3 W8A8 | ~2–5% | H100 default |
+| BF16 → INT4 GPTQ/AWQ W4A16 | ~5–10% | optional |
+| BF16 → NVFP4 W4A4 (Blackwell) | ~10–20% | GB200 default |
+| BF16 → INT4 uncalibrated | ~15–30% | not recommended |
+
+**15% perturbation is approximately the NVFP4 (FP4) regime.**  FP8 is the current
+"transparent" production floor (~3–5%).  The experiments in this log target the
+regime between FP8 and NVFP4, where selective full-precision computation for hot
+channels recovers quality compared to global low-precision quantization.
+
+#### Best results in this log (as of exp33)
+
+| Scheme | Perturbation | Hot% | Quantization analogue |
+|---|---|---|---|
+| Exp14 ternary @10% hot | 48.4% | 10% | worse than uncalibrated INT4 |
+| Exp24 E5M3 T=0.20 | 18.2% | ~88% | lower end of NVFP4 |
+| Exp27 SVD r1024 @50% hot | 16.6% | ~50% | NVFP4 range |
+| **Exp33 kr=0.5+ft @20% hot** | **15.0%** | 20% | **NVFP4 range** |
+| **Exp33 kr=0.5+ft @50% hot** | **12.4%** | 50% | **upper FP8 / lower NVFP4** |
+
+The gap to FP8-equivalent quality (~3–5% perturbation) remains ~10 pp and is the
+primary target for future experiments.
+
 ### Practical helper for exp12+
 
 All metrics share the same `W_U` GEMM.  Recommended single helper:
